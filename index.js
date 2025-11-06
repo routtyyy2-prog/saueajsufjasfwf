@@ -1,210 +1,158 @@
+// index.js - Secure Loader Backend (max protection)
 require('dotenv').config();
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
-
-let _fetch = globalThis.fetch;
-if (!_fetch) {
-  _fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-}
-const fetch = (...args) => _fetch(...args);
+const fetch = (globalThis.fetch) ? globalThis.fetch : (...args) => import('node-fetch').then(m => m.default(...args));
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '128kb' }));
 
 const PORT = process.env.PORT || 8080;
-const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
 const REPO_RAW_URL = process.env.REPO_RAW_URL || "";
 const SECRET_KEY = process.env.SECRET_KEY || "";
+const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
+const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || ""; // optional Slack/Discord webhook for alerts
 
-if (!REPO_RAW_URL) {
-  console.error("❌ Missing REPO_RAW_URL in environment");
+if (!REPO_RAW_URL || !SECRET_KEY) {
+  console.error("Missing REPO_RAW_URL or SECRET_KEY");
   process.exit(1);
 }
 
-// Rate limiting - более строгий для безопасности
-const limiter = rateLimit({ 
-  windowMs: 60 * 1000, 
-  max: 10, // Снизили до 10 запросов в минуту
-  message: 'Too many requests'
-});
+// in-memory stores (suitable for single instance)
+const tokens = new Map(); // token -> { hwid, ip, expires, used }
+const nonces = new Map(); // nonceKey -> timestamp
 
-// Хранилище одноразовых токенов
-const tokens = new Map();
-
-// Очистка просроченных токенов каждую минуту
+// Cleanup job
 setInterval(() => {
   const now = Date.now();
-  for (const [token, data] of tokens.entries()) {
-    if (now > data.expires) {
-      tokens.delete(token);
-    }
-  }
-}, 60000);
+  for (const [k, v] of tokens) if (v.expires <= now) tokens.delete(k);
+  for (const [k, ts] of nonces) if (now - ts > 30000) nonces.delete(k);
+}, 5000);
 
-// XOR шифрование ПО БАЙТАМ
-function xorEncrypt(text, key) {
-  const buf = Buffer.from(text, 'utf8');   // исходный скрипт как байты
-  const kb  = Buffer.from(key,  'utf8');   // ключ как байты (строка hwid)
+// Rate limit
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true, legacyHeaders: false
+}));
 
-  for (let i = 0; i < buf.length; i++) {
-    buf[i] = buf[i] ^ kb[i % kb.length];
-  }
-  return buf.toString('base64');           // отдаем base64 зашифрованных БАЙТОВ
+// helpers
+const md5 = (s) => crypto.createHash('md5').update(s).digest('hex');
+
+function verifyValveFingerprint(req) {
+  const ua = (req.headers['user-agent']||"").toString();
+  const acs = (req.headers['accept-charset']||"").toString();
+  const aenc = (req.headers['accept-encoding']||"").toString();
+  if (!ua.includes("Valve/Steam HTTP Client")) return false;
+  if (!acs.toLowerCase().includes("iso-8859-1")) return false;
+  if (!aenc.toLowerCase().includes("identity")) return false;
+  return true;
 }
 
+function alertAdmin(payload) {
+  if (!ALERT_WEBHOOK) return;
+  try {
+    fetch(ALERT_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: payload }) });
+  } catch (e) { console.warn("alert failed", e); }
+}
 
-// Health check
+function xorEncryptUtf8(text, key) {
+  const buf = Buffer.from(text, 'utf8');
+  const kb = Buffer.from(key, 'utf8');
+  for (let i = 0; i < buf.length; i++) buf[i] ^= kb[i % kb.length];
+  return buf.toString('base64');
+}
+
+// health
 app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    has_repo_url: Boolean(REPO_RAW_URL),
-    has_token: Boolean(GITLAB_TOKEN),
-    active_tokens: tokens.size
-  });
+  res.json({ ok: true, tokens: tokens.size, nonces: nonces.size, repo: !!REPO_RAW_URL });
 });
 
-// ШАГ 1: Получение одноразового токена
-app.post('/auth', limiter, (req, res) => {
+// AUTH
+app.post('/auth', async (req, res) => {
   try {
-    const { hwid, timestamp, signature } = req.body;
+    const { hwid, timestamp, signature, nonce } = req.body || {};
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "";
 
-    // Проверка наличия всех параметров
-    if (!hwid || !timestamp || !signature) {
-      console.log('❌ Missing parameters');
-      return res.status(400).json({ error: 'Missing required parameters' });
+    if (!verifyValveFingerprint(req)) {
+      return res.status(403).json({ error: 'Invalid client' });
     }
-
-    // Проверка timestamp (защита от replay атак)
-    const now = Date.now();
-    const reqTime = parseInt(timestamp);
-    
-    if (isNaN(reqTime) || Math.abs(now - reqTime) > 30000) {
-      console.log(`❌ Invalid/expired timestamp: ${timestamp}`);
-      return res.status(403).json({ error: 'Request expired or invalid timestamp' });
+    if (!hwid || !timestamp || !signature || !nonce) {
+      return res.status(400).json({ error: 'Missing params' });
     }
+    const ts = parseInt(timestamp, 10);
+    if (isNaN(ts) || Math.abs(Date.now() - ts) > 30000) {
+      return res.status(403).json({ error: 'Timestamp invalid/expired' });
+    }
+    const nonceKey = `${timestamp}:${nonce}`;
+    if (nonces.has(nonceKey)) {
+      alertAdmin(`Replay attempt ${hwid.substring(0,8)} from ${ip}`);
+      return res.status(403).json({ error: 'Replay detected' });
+    }
+    nonces.set(nonceKey, Date.now());
 
-    // Проверка подписи (используем MD5 вместо HMAC SHA256 для совместимости с Lua)
-    const expectedSig = crypto
-      .createHash('md5')
-      .update(SECRET_KEY + hwid + timestamp)
-      .digest('hex');
-
-    if (signature !== expectedSig) {
-      console.log(`❌ Invalid signature for HWID: ${hwid.substring(0, 8)}...`);
+    const expected = md5(SECRET_KEY + hwid + timestamp + nonce);
+    if (signature !== expected) {
+      alertAdmin(`Invalid signature attempt ${hwid.substring(0,8)} from ${ip}`);
       return res.status(403).json({ error: 'Invalid signature' });
     }
 
-    // Генерация одноразового токена
+    // issue token
     const token = crypto.randomBytes(32).toString('hex');
-    
-    // Токен живёт 10 секунд
-    tokens.set(token, {
-      hwid,
-      expires: Date.now() + 10000,
-      used: false
-    });
-
-    console.log(`✅ Token issued for HWID: ${hwid.substring(0, 8)}...`);
-    
-    res.json({ 
-      token,
-      expires_in: 10
-    });
+    tokens.set(token, { hwid, ip, expires: Date.now() + 10000, used: false });
+    console.log(`Token issued ${token.substring(0,8)} for ${hwid.substring(0,8)} from ${ip}`);
+    res.json({ token, expires_in: 10 });
   } catch (err) {
-    console.error("AUTH ERROR:", err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error("auth error", err);
+    res.status(500).json({ error: 'Internal' });
   }
 });
 
-// ШАГ 2: Загрузка скрипта с токеном
+// LOAD
 app.post('/load', async (req, res) => {
   try {
-    const { token } = req.body;
+    if (!verifyValveFingerprint(req)) return res.status(403).json({ error: 'Invalid client' });
+    const { token } = req.body || {};
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || "";
 
-    if (!token) {
-      return res.status(400).json({ error: 'Missing token' });
-    }
-
-    const tokenData = tokens.get(token);
-
-    // Проверка существования токена
-    if (!tokenData) {
-      console.log(`❌ Token not found: ${token.substring(0, 8)}...`);
-      return res.status(403).json({ error: 'Invalid token' });
-    }
-
-    // Проверка срока действия
-    if (Date.now() > tokenData.expires) {
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    const t = tokens.get(token);
+    if (!t) return res.status(403).json({ error: 'Invalid token' });
+    if (t.used) return res.status(403).json({ error: 'Token already used' });
+    if (Date.now() > t.expires) {
       tokens.delete(token);
-      console.log(`❌ Token expired: ${token.substring(0, 8)}...`);
       return res.status(403).json({ error: 'Token expired' });
     }
-
-    // Проверка что токен не использован (одноразовый!)
-    if (tokenData.used) {
-      console.log(`❌ Token already used: ${token.substring(0, 8)}...`);
-      return res.status(403).json({ error: 'Token already used' });
+    if (t.ip !== ip) {
+      alertAdmin(`IP mismatch token ${token.substring(0,8)} ${t.ip} != ${ip}`);
+      return res.status(403).json({ error: 'IP mismatch' });
     }
 
-    // Помечаем токен как использованный
-    tokenData.used = true;
-
-    // Загружаем скрипт из GitLab
+    // fetch script from repo
     const headers = {};
-    if (GITLAB_TOKEN) {
-      headers['PRIVATE-TOKEN'] = GITLAB_TOKEN;
-    }
-
+    if (GITLAB_TOKEN) headers['PRIVATE-TOKEN'] = GITLAB_TOKEN;
     const r = await fetch(REPO_RAW_URL, { headers });
-    
     if (!r.ok) {
-      const errorText = await r.text().catch(() => "");
-      console.error(`❌ GitLab error: ${r.status}`);
-      return res.status(502).json({ 
-        error: 'Upstream error',
-        status: r.status 
-      });
+      console.error("upstream fetch failed", r.status);
+      return res.status(502).json({ error: 'Upstream' });
     }
-
     const script = await r.text();
 
-    // Шифруем скрипт с использованием HWID как ключа
-    const encrypted = xorEncrypt(script, tokenData.hwid);
-
-    // Удаляем использованный токен
+    // encrypt script bytes with hwid
+    const encrypted = xorEncryptUtf8(script, t.hwid);
+    t.used = true;
     tokens.delete(token);
-
-    console.log(`✅ Script delivered to HWID: ${tokenData.hwid.substring(0, 8)}...`);
-    
-    // Отдаём зашифрованный скрипт
+    console.log(`Script delivered to ${t.hwid.substring(0,8)} (${ip})`);
     res.type('text/plain').send(encrypted);
   } catch (err) {
-    console.error("LOAD ERROR:", err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error("load error", err);
+    res.status(500).json({ error: 'Internal' });
   }
 });
 
-// Fallback для GET запросов - отказываем в доступе
-app.get('/get_main', (req, res) => {
-  res.status(403).json({ 
-    error: 'Direct access forbidden. Use the loader.' 
-  });
-});
+// block GETs and other methods
+app.get('/load', (req, res) => res.status(405).json({ error: 'Use POST' }));
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-app.get('/load', (req, res) => {
-  res.status(405).json({ 
-    error: 'Method not allowed. Use POST.' 
-  });
-});
-
-// 404 для всех остальных путей
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Secure loader proxy running on port ${PORT}`);
-  console.log(`✅ Secret key: ${SECRET_KEY.substring(0, 4)}...`);
-  console.log(`✅ GitLab configured: ${Boolean(GITLAB_TOKEN)}`);
-});
+app.listen(PORT, () => console.log("Secure loader running on port", PORT));
