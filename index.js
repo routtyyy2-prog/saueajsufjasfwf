@@ -439,7 +439,9 @@ app.post('/auth', async (req, res) => {
     // SUCCESS - выдаем токен для загрузки
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = sha256(token);
-    
+    tokens.set(tokenHash, data);
+    const encryptedToken = xorEncrypt(token, hwid);
+
     const data = { 
       hwid, 
       ip, 
@@ -454,10 +456,10 @@ app.post('/auth', async (req, res) => {
 
     console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${realKeyName} | Script: ${script_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
     
-    res.json({ 
-      token, 
-      expires_in: 5,
-      server_fp: EXPECTED_CERT_FINGERPRINT
+    res.json({
+        token: encryptedToken,  // вместо plaintext
+        expires_in: 5,
+        server_fp: EXPECTED_CERT_FINGERPRINT
     });
 
   } catch (e) {
