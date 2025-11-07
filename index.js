@@ -12,6 +12,7 @@ if (!_fetch) {
 const fetch = (...args) => _fetch(...args);
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
 
 // === CONFIGURATION ===
@@ -58,16 +59,16 @@ setInterval(() => {
   }
 }, 5000);
 
-// === RATE LIMITING ===
-// Глобальный rate limit по IP
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 15, // 15 запросов в минуту с одного IP
+  max: 10,
   standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,   // теперь req.ip корректный благодаря trust proxy
   message: { error: 'Too many requests' }
 });
-
 app.use(globalLimiter);
+
 
 // === UTILITY FUNCTIONS ===
 function md5(str) {
@@ -107,15 +108,17 @@ function constantTimeCompare(a, b) {
   return diff === 0;
 }
 
-// Проверка fingerprint клиента
 function verifyClientFingerprint(req, hwid, nonce) {
-  const xClientFp = req.headers['x-client-fp'] || '';
-  
-  // Ожидаемый fingerprint: MD5(hwid:nonce:SECRET_CHECKSUM)
-  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
-  
-  return constantTimeCompare(xClientFp, expectedFp);
+  const got = (req.headers['x-client-fp'] || '').toString();
+  const expected = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
+  if (got && got.length === 32 && got === expected) return true;
+  console.warn("FP mismatch", {
+    got: got?.slice(0,8), exp: expected.slice(0,8),
+    hwid: hwid?.slice(0,8), nonce: nonce?.slice(0,8)
+  });
+  return false;
 }
+
 
 // Rate limit по HWID (защита от bruteforce)
 function checkHwidRateLimit(hwid) {
