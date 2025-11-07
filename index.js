@@ -436,30 +436,35 @@ app.post('/auth', async (req, res) => {
       return res.status(403).json({ error: 'Script not allowed' });
     }
 
-    // SUCCESS - выдаем токен для загрузки
+    // === УСПЕХ - ГЕНЕРИРУЕМ ТОКЕН ===
+    // ВАЖНО: Вначале ОПРЕДЕЛИ data, ПОТОМ используй его!
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = sha256(token);
-    tokens.set(tokenHash, data);
-    const encryptedToken = xorEncrypt(token, hwid);
-
-    const data = { 
+    
+    // ← ПРАВИЛЬНЫЙ ПОРЯДОК: сначала определи data
+    const tokenData = { 
       hwid, 
       ip, 
       ua, 
       key: realKeyName,
       script_name,
-      expires: now + 5000, 
+      expires: now + 5000,  // токен живет 5 секунд
       used: false, 
       created: now 
     };
-    tokens.set(tokenHash, data);
+    
+    // Потом используй его
+    tokens.set(tokenHash, tokenData);
+
+    // Шифруй токен перед отправкой (защита от Fiddler)
+    const encryptedToken = xorEncrypt(token, hwid);
 
     console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${realKeyName} | Script: ${script_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
     
     res.json({
-        token: encryptedToken,  // вместо plaintext
-        expires_in: 5,
-        server_fp: EXPECTED_CERT_FINGERPRINT
+      token: encryptedToken,  // шифрованный токен
+      expires_in: 5,
+      server_fp: EXPECTED_CERT_FINGERPRINT?.trim() || ""
     });
 
   } catch (e) {
@@ -468,6 +473,7 @@ app.post('/auth', async (req, res) => {
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
 
 // === LOAD (с загрузкой из GitLab) ===
 app.post('/load', async (req, res) => {
@@ -512,28 +518,35 @@ app.post('/load', async (req, res) => {
     const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
     if (!scriptPath) {
       console.error("❌ Unknown script:", tdata.script_name);
+      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Unknown script');
       return res.status(404).json({ error: 'Script not found' });
     }
 
     // Загрузить из GitLab
-    const script = await fetchGitLabScript(scriptPath);
-    if (!script) {
+    const scriptCode = await fetchGitLabScript(scriptPath);
+    if (!scriptCode) {
       console.error("❌ Script fetch failed");
+      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Script fetch failed');
       return res.status(502).json({ error: 'Upstream error' });
     }
 
-    const enc = xorEncrypt(script, tdata.hwid);
+    // Шифруй скрипт
+    const encryptedScript = xorEncrypt(scriptCode, tdata.hwid);
+    
+    // Удали токен (одноразовый)
     tokens.delete(tokenHash);
 
-    console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip}`);
-    res.type('text/plain').send(enc);
+    console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip} | Size=${encryptedScript.length}b`);
+    
+    res.type('text/plain').send(encryptedScript);
 
   } catch (e) {
     console.error("❌ LOAD ERROR:", e);
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Load error');
+    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Load error: ' + e.message);
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
 
 // === TAMPER REPORT ===
 app.post('/report_tamper', async (req, res) => {
