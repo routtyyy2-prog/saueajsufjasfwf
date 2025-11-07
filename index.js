@@ -19,7 +19,7 @@ app.use(express.json({ limit: '64kb' }));
 const PORT = process.env.PORT || 8080;
 const REPO_RAW_URL = process.env.REPO_RAW_URL || "";
 const SECRET_KEY = process.env.SECRET_KEY || "";
-const SECRET_CHECKSUM = process.env.SECRET_CHECKSUM || ""; // MD5 хеш SECRET_KEY
+const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || ""; // Discord webhook для алертов
 
@@ -110,14 +110,25 @@ function constantTimeCompare(a, b) {
 
 function verifyClientFingerprint(req, hwid, nonce) {
   const got = (req.headers['x-client-fp'] || '').toString();
-  const expected = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
-  if (got && got.length === 32 && got === expected) return true;
+  const expected = crypto.createHash('md5')
+    .update(`${hwid}:${nonce}:${SECRET_CHECKSUM}`)
+    .digest('hex');
+
+  if (got && got.length === 32) {
+    // безопасное сравнение
+    let diff = 0;
+    for (let i = 0; i < 32; i++) diff |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+    if (diff === 0) return true;
+  }
   console.warn("FP mismatch", {
-    got: got?.slice(0,8), exp: expected.slice(0,8),
-    hwid: hwid?.slice(0,8), nonce: nonce?.slice(0,8)
+    got: got.slice(0,8),
+    exp: expected.slice(0,8),
+    hwid: (hwid||'').slice(0,8),
+    nonce: (nonce||'').slice(0,8)
   });
   return false;
 }
+
 
 
 // Rate limit по HWID (защита от bruteforce)
