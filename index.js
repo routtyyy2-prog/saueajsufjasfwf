@@ -1,6 +1,4 @@
-// index.js - ULTRA SECURE (Anti-MITM, Certificate Pinning, Auto-ban)
-// Защита: Fiddler, Charles, mitmproxy, replay, script dump
-
+// ULTRA SECURE RAILWAY SERVER WITH GITLAB INTEGRATION
 require('dotenv').config();
 const express = require('express');
 const rateLimit = require('express-rate-limit');
@@ -18,7 +16,6 @@ app.use(express.json({ limit: '64kb' }));
 
 // === CONFIG ===
 const PORT = process.env.PORT || 8080;
-const REPO_RAW_URL = process.env.REPO_RAW_URL || "";
 const SECRET_KEY = process.env.SECRET_KEY || "";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
@@ -26,12 +23,16 @@ const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || "";
 const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
 const KEYS_FILE = "keys.json";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
+const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 
-// === ANTI-MITM: Expected certificate fingerprint (SHA256 of Railway cert) ===
-// Client will verify this to detect proxy interception
-const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "RAILWAY_CERT_SHA256_HERE";
+// Маппинг: имя скрипта -> путь в GitLab
+const SCRIPT_REGISTRY = {
+  "wingz.gs": "test12.lua",
+  "other.script": "other.lua",
+  // добавляйте другие скрипты
+};
 
-if (!REPO_RAW_URL || !SECRET_KEY || !GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
+if (!SECRET_KEY || !GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
   console.error("❌ Missing env vars");
   process.exit(1);
 }
@@ -42,7 +43,7 @@ const nonces = new Map();
 const failedAttempts = new Map();
 const rateLimitStore = new Map();
 const bannedHwids = new Set();
-const suspiciousIPs = new Map(); // Track MITM attempts
+const suspiciousIPs = new Map();
 const keysCache = { data: null, lastFetch: 0, ttl: 10000 };
 
 setInterval(() => {
@@ -84,6 +85,23 @@ async function fetchGitLabKeys() {
     return data;
   } catch (e) {
     console.error("❌ GitLab error:", e.message);
+    return null;
+  }
+}
+
+async function fetchGitLabScript(scriptPath) {
+  const encodedPath = scriptPath.replace(/([^a-zA-Z0-9-._~])/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const url = `https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encodedPath}/raw?ref=${GITLAB_BRANCH}`;
+
+  try {
+    const res = await fetch(url, { headers: gitlabHeaders() });
+    if (!res.ok) {
+      console.error("❌ Script fetch failed:", res.status);
+      return null;
+    }
+    return await res.text();
+  } catch (e) {
+    console.error("❌ Script fetch error:", e.message);
     return null;
   }
 }
@@ -144,9 +162,8 @@ function constantTimeCompare(a, b) {
   return diff === 0;
 }
 
-// ENHANCED XOR with randomized padding
 function xorEncrypt(txt, key) {
-  const padding = crypto.randomBytes(16).toString('hex'); // 32 chars
+  const padding = crypto.randomBytes(16).toString('hex');
   const fullText = padding + txt + padding;
   
   const tb = Buffer.from(fullText, 'utf8');
@@ -154,7 +171,7 @@ function xorEncrypt(txt, key) {
   const res = Buffer.alloc(tb.length);
   
   for (let i = 0; i < tb.length; i++) {
-    res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF); // Extra XOR with position
+    res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
   }
   
   return res.toString('base64');
@@ -183,27 +200,22 @@ async function sendAlert(message, level = 'warning') {
 function detectMITM(req) {
   const indicators = [];
   
-  // Check for proxy headers
   if (req.headers['via']) indicators.push('Via header');
   if (req.headers['forwarded']) indicators.push('Forwarded header');
   if (req.headers['proxy-connection']) indicators.push('Proxy-Connection');
   if (req.headers['x-proxy-id']) indicators.push('X-Proxy-ID');
   
-  // Check for modified Accept headers (Fiddler signature)
   const accept = (req.headers['accept'] || '').toLowerCase();
   if (accept.includes('fiddler') || accept.includes('charles')) {
-    indicators.push('Proxy tool detected in Accept');
+    indicators.push('Proxy tool detected');
   }
   
-  // Check Connection header (proxies often modify)
   const conn = (req.headers['connection'] || '').toLowerCase();
   if (conn.includes('proxy')) indicators.push('Proxy in Connection');
   
-  // Check for missing or weird User-Agent
   const ua = req.headers['user-agent'] || '';
   if (!ua || ua.length < 20) indicators.push('Suspicious UA');
   
-  // Check for TLS interception markers
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
   if (proto !== 'https') indicators.push('Non-HTTPS');
   
@@ -215,7 +227,7 @@ function checkHwidRateLimit(hwid) {
   const limit = rateLimitStore.get(hwid);
   if (!limit) { rateLimitStore.set(hwid, { count: 1, resetTime: now + 60000 }); return true; }
   if (now > limit.resetTime) { rateLimitStore.set(hwid, { count: 1, resetTime: now + 60000 }); return true; }
-  if (limit.count >= 3) return false; // Снижено до 3
+  if (limit.count >= 3) return false;
   limit.count++; return true;
 }
 
@@ -232,7 +244,6 @@ async function logSuspiciousActivity(ip, hwid, key, reason, autoban = false) {
   
   console.warn(`⚠️ SUSPICIOUS: ${reason} | IP: ${ip} | HWID: ${hwid?.slice(0,8)} | Key: ${key?.slice(0,8)} | #${a.count}`);
   
-  // Auto-ban logic
   if (autoban || a.count >= 3) {
     if (hwid) bannedHwids.add(hwid);
     if (key) {
@@ -250,7 +261,23 @@ async function logSuspiciousActivity(ip, hwid, key, reason, autoban = false) {
   }
 }
 
-// === GLOBAL RATE LIMIT ===
+function findKeyCaseInsensitive(keys, inputKey) {
+  if (!keys || !inputKey) return [null, null];
+  if (keys[inputKey]) return [keys[inputKey], inputKey];
+  const lower = inputKey.toLowerCase();
+  for (const [k, v] of Object.entries(keys)) {
+    if (k.toLowerCase() === lower) return [v, k];
+  }
+  return [null, null];
+}
+
+function checkScriptAllowed(keyEntry, scriptName) {
+  if (!keyEntry) return false;
+  if (!Array.isArray(keyEntry.scripts) || keyEntry.scripts.length === 0) return true;
+  return keyEntry.scripts.includes(scriptName);
+}
+
+// === RATE LIMIT ===
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 8,
@@ -269,11 +296,11 @@ app.get('/health', (req, res) => res.json({
   cert_fp: EXPECTED_CERT_FINGERPRINT.slice(0, 16) + "..."
 }));
 
-// === AUTH ===
+// === AUTH (с проверкой ключа из GitLab) ===
 app.post('/auth', async (req, res) => {
   const ip = getClientIP(req);
   const ua = req.headers['user-agent'] || 'unknown';
-  const { hwid, timestamp, nonce, signature, key, client_cert_fp } = req.body || {};
+  const { hwid, timestamp, nonce, signature, key, script_name, client_cert_fp } = req.body || {};
 
   // MITM Detection
   const mitmIndicators = detectMITM(req);
@@ -288,8 +315,7 @@ app.post('/auth', async (req, res) => {
       `**IP:** \`${ip}\`\n` +
       `**Indicators:** ${mitmIndicators.join(', ')}\n` +
       `**HWID:** \`${hwid?.slice(0,12) || 'unknown'}\`\n` +
-      `**Key:** \`${key?.slice(0,12) || 'unknown'}\`\n` +
-      `**Attempts:** ${suspData.count}`,
+      `**Key:** \`${key?.slice(0,12) || 'unknown'}\``,
       'critical'
     );
     
@@ -300,14 +326,13 @@ app.post('/auth', async (req, res) => {
     return res.status(403).json({ error: 'Proxy detected' });
   }
 
-  // Certificate Pinning Check (client должен отправить fingerprint сертификата)
-  if (client_cert_fp && !constantTimeCompare(client_cert_fp, EXPECTED_CERT_FINGERPRINT)) {
+  // Certificate Pinning
+  if (client_cert_fp && EXPECTED_CERT_FINGERPRINT && !constantTimeCompare(client_cert_fp, EXPECTED_CERT_FINGERPRINT)) {
     await sendAlert(
       `**🔴 CERT PINNING FAIL**\n` +
       `**Expected:** \`${EXPECTED_CERT_FINGERPRINT.slice(0,32)}...\`\n` +
       `**Got:** \`${client_cert_fp.slice(0,32)}...\`\n` +
-      `**IP:** \`${ip}\`\n` +
-      `**HWID:** \`${hwid?.slice(0,12)}\``,
+      `**IP:** \`${ip}\``,
       'critical'
     );
     await logSuspiciousActivity(ip, hwid, key, 'Certificate mismatch', true);
@@ -315,7 +340,7 @@ app.post('/auth', async (req, res) => {
   }
 
   try {
-    if (!hwid || !timestamp || !nonce || !signature || !key) {
+    if (!hwid || !timestamp || !nonce || !signature || !key || !script_name) {
       await logSuspiciousActivity(ip, hwid, key, 'Missing params');
       return res.status(400).json({ error: 'Missing params' });
     }
@@ -352,7 +377,7 @@ app.post('/auth', async (req, res) => {
     // Fingerprint
     if (!verifyClientFingerprint(req, hwid, nonce)) {
       await logSuspiciousActivity(ip, hwid, key, 'Bad fingerprint', true);
-      await sendAlert(`**🔴 FINGERPRINT FAIL**\nHWID: \`${hwid}\`\nIP: \`${ip}\`\nKey: \`${key}\``, 'critical');
+      await sendAlert(`**🔴 FINGERPRINT FAIL**\nHWID: \`${hwid}\`\nIP: \`${ip}\``, 'critical');
       return res.status(403).json({ error: 'Bad FP' });
     }
 
@@ -363,24 +388,15 @@ app.post('/auth', async (req, res) => {
       return res.status(403).json({ error: 'Bad sig' });
     }
 
-    // === KEY VALIDATION ===
+    // === KEY VALIDATION (GITLAB) ===
     const keysData = await fetchGitLabKeys();
     if (!keysData || !keysData.keys) {
       console.error("❌ Cannot fetch keys");
       return res.status(500).json({ error: 'Server error' });
     }
 
-    let keyEntry = null;
-    let realKeyName = null;
-    const keyLower = key.toLowerCase();
-    for (const [k, v] of Object.entries(keysData.keys)) {
-      if (k.toLowerCase() === keyLower) {
-        keyEntry = v;
-        realKeyName = k;
-        break;
-      }
-    }
-
+    const [keyEntry, realKeyName] = findKeyCaseInsensitive(keysData.keys, key);
+    
     if (!keyEntry) {
       await logSuspiciousActivity(ip, hwid, key, 'Invalid key');
       return res.status(403).json({ error: 'Invalid key' });
@@ -404,27 +420,44 @@ app.post('/auth', async (req, res) => {
       return res.status(403).json({ error: 'HWID mismatch' });
     }
 
-    // SUCCESS
+    // Если это запрос валидации (без загрузки скрипта)
+    if (script_name === "__validate__") {
+      console.log(`✅ Key validated: ${realKeyName} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
+      return res.json({
+        success: true,
+        expires: keyExpiry,
+        key: realKeyName
+      });
+    }
+
+    // Script permission check
+    if (!checkScriptAllowed(keyEntry, script_name)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Script not allowed');
+      return res.status(403).json({ error: 'Script not allowed' });
+    }
+
+    // SUCCESS - выдаем токен для загрузки
     const token = crypto.randomBytes(32).toString('hex');
-    const tokenHash = sha256(token); // Store hash, send plain
+    const tokenHash = sha256(token);
     
     const data = { 
       hwid, 
       ip, 
       ua, 
       key: realKeyName,
+      script_name,
       expires: now + 5000, 
       used: false, 
       created: now 
     };
     tokens.set(tokenHash, data);
 
-    console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${realKeyName} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
+    console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${realKeyName} | Script: ${script_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
     
     res.json({ 
       token, 
       expires_in: 5,
-      server_fp: EXPECTED_CERT_FINGERPRINT // Отправляем клиенту для проверки
+      server_fp: EXPECTED_CERT_FINGERPRINT
     });
 
   } catch (e) {
@@ -434,7 +467,7 @@ app.post('/auth', async (req, res) => {
   }
 });
 
-// === LOAD ===
+// === LOAD (с загрузкой из GitLab) ===
 app.post('/load', async (req, res) => {
   const ip = getClientIP(req);
   const { token } = req.body || {};
@@ -466,26 +499,31 @@ app.post('/load', async (req, res) => {
 
   if (tdata.ip !== ip) {
     await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'IP change', true);
-    await sendAlert(`**🔴 TOKEN STOLEN**\nKey: \`${tdata.key}\`\nExpected: \`${tdata.ip}\`\nGot: \`${ip}\`\nHWID: \`${tdata.hwid}\``, 'critical');
+    await sendAlert(`**🔴 TOKEN STOLEN**\nKey: \`${tdata.key}\`\nExpected: \`${tdata.ip}\`\nGot: \`${ip}\``, 'critical');
     return res.status(403).json({ error: 'IP mismatch' });
   }
 
   tdata.used = true;
 
   try {
-    const headers = { 'PRIVATE-TOKEN': GITLAB_TOKEN };
-    const resp = await fetch(REPO_RAW_URL, { headers });
-    
-    if (!resp.ok) {
-      console.error("❌ Script fetch failed:", resp.status);
+    // Найти файл скрипта
+    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
+    if (!scriptPath) {
+      console.error("❌ Unknown script:", tdata.script_name);
+      return res.status(404).json({ error: 'Script not found' });
+    }
+
+    // Загрузить из GitLab
+    const script = await fetchGitLabScript(scriptPath);
+    if (!script) {
+      console.error("❌ Script fetch failed");
       return res.status(502).json({ error: 'Upstream error' });
     }
 
-    const script = await resp.text();
     const enc = xorEncrypt(script, tdata.hwid);
     tokens.delete(tokenHash);
 
-    console.log(`✅ Script delivered: Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip}`);
+    console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip}`);
     res.type('text/plain').send(enc);
 
   } catch (e) {
@@ -534,11 +572,12 @@ app.use((req,res)=>res.status(404).json({error:'Not found'}));
 // === START ===
 app.listen(PORT, () => {
   console.log(`\n🔒 ============================================`);
-  console.log(`   ULTRA SECURE LOADER v3.0 (Anti-MITM)`);
+  console.log(`   ULTRA SECURE LOADER v4.0`);
   console.log(`   ============================================`);
   console.log(`   ✅ Port: ${PORT}`);
+  console.log(`   ✅ GitLab Integration: ENABLED`);
   console.log(`   ✅ Auto-ban: ENABLED`);
   console.log(`   ✅ MITM detection: ENABLED`);
-  console.log(`   ✅ Certificate pinning: ${!!EXPECTED_CERT_FINGERPRINT}`);
+  console.log(`   ✅ Scripts: ${Object.keys(SCRIPT_REGISTRY).length}`);
   console.log(`============================================\n`);
 });
