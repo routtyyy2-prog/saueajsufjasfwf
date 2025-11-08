@@ -1,22 +1,23 @@
 {
-  "name": "secure-loader-proxy",
-  "version": "2.0.0",
-  "description": "Secure loader proxy with token-based authentication",
+  "name": "loader",
+  "version": "1.0.0",
+  "description": "secure loader",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
-    "node-fetch": "^3.3.2"
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^2.7.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }
