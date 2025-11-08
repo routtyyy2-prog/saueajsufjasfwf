@@ -25,11 +25,19 @@ const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-
+function hmacMd5Hex(key, bodyString) {
+  return crypto.createHmac('md5', key).update(bodyString, 'utf8').digest('hex');
+}
+function signedJson(res, obj) {
+  const body = JSON.stringify(obj);
+  const sig  = hmacMd5Hex(SECRET_KEY, body);
+  res.set('X-Resp-Sig', sig);
+  res.type('application/json').send(body);
+}
+// ⬆⬆⬆
 // Маппинг: имя скрипта -> путь в GitLab
 const SCRIPT_REGISTRY = {
-  "wingz.gs": "test12.lua",
-  "other.script": "other.lua",
+  "kaelis.gs": "test12.lua",
   // добавляйте другие скрипты
 };
 
