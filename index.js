@@ -530,7 +530,7 @@ app.post('/auth', async (req, res) => {
     if (script_name === "__validate__") {
       console.log(`✅ Key validated: ${keyEntry.key_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
       await logActivity('validate', ip, hwid, keyEntry.key_name, 'success');
-      return res.json({
+      return signedJson(res, {
         success: true,
         expires: keyExpiry,
         key: keyEntry.key_name
@@ -566,10 +566,10 @@ app.post('/auth', async (req, res) => {
     console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${keyEntry.key_name} | Script: ${script_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
     await logActivity('auth_success', ip, hwid, keyEntry.key_name, script_name);
     
-    res.json({
-      token: encryptedToken,  // шифрованный токен
+    signedJson(res, {
+      token: encryptedToken,
       expires_in: 5,
-      server_fp: EXPECTED_CERT_FINGERPRINT?.trim() || ""
+      server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
     });
 
   } catch (e) {
@@ -644,6 +644,8 @@ app.post('/load', async (req, res) => {
     console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip} | Size=${encryptedScript.length}b`);
     await logActivity('load_success', ip, tdata.hwid, tdata.key, tdata.script_name);
     
+    const sig = hmacMd5Hex(SECRET_KEY, encryptedScript);
+    res.set('X-Resp-Sig', sig);
     res.type('text/plain').send(encryptedScript);
 
   } catch (e) {
