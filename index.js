@@ -55,8 +55,43 @@ const pool = new Pool({
 pool.on('error', (err) => {
   console.error('❌ PostgreSQL pool error:', err);
 });
+async function runMigrations() {
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS keys (
+    key_name TEXT PRIMARY KEY,
+    hwid TEXT DEFAULT NULL,
+    expires BIGINT NOT NULL,
+    scripts JSONB DEFAULT '[]',
+    banned BOOLEAN DEFAULT FALSE,
+    ban_reason TEXT,
+    banned_at BIGINT,
+    banned_hwid TEXT,
+    banned_ip TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 
-// === STORES ===
+  CREATE TABLE IF NOT EXISTS banned_hwids (
+    hwid TEXT PRIMARY KEY,
+    reason TEXT,
+    banned_at BIGINT,
+    banned_by_key TEXT,
+    banned_ip TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS activity_log (
+    id BIGSERIAL PRIMARY KEY,
+    event_type TEXT,
+    ip TEXT,
+    hwid TEXT,
+    key_name TEXT,
+    details TEXT,
+    timestamp BIGINT
+  );
+  `);
+  console.log('✅ DB migrations applied');
+}
+
 const tokens = new Map();
 const nonces = new Map();
 const failedAttempts = new Map();
@@ -649,6 +684,7 @@ app.use((req,res)=>res.status(404).json({error:'Not found'}));
 
 // === START ===
 app.listen(PORT, async () => {
+  await runMigrations();
   console.log(`\n🔒 ============================================`);
   console.log(`   ULTRA SECURE LOADER v5.0 (PostgreSQL)`);
   console.log(`   ============================================`);
