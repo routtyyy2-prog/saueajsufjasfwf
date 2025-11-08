@@ -25,17 +25,42 @@ const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-function hmacMd5Hex(key, bodyString) {
-  return crypto.createHmac('md5', key).update(bodyString, 'utf8').digest('hex');
+function md5hex(s) {
+  return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
+
+// Важно: имитируем твою Lua-функцию: md5(ipad..msg) => hex, затем md5(opad..innerHex)
+function hmacMd5LuaCompat(key, msg) {
+  const block = 64;
+  if (key.length > block) key = md5hex(key); // как в твоём Lua
+
+  const kb = Buffer.from(key, 'utf8');
+  let ipad = '';
+  let opad = '';
+  for (let i = 0; i < block; i++) {
+    const b = i < kb.length ? kb[i] : 0;
+    ipad += String.fromCharCode(b ^ 0x36);
+    opad += String.fromCharCode(b ^ 0x5c);
+  }
+  const inner = md5hex(ipad + msg);     // md5 → HEX-СТРОКА
+  const outer = md5hex(opad + inner);   // md5(opad || HEX(inner))
+  return outer;                         // hex
+}
+
+// Отправить JSON с подписью (подписываем ровно JSON.stringify(obj))
 function signedJson(res, obj) {
   const body = JSON.stringify(obj);
-  const sig  = hmacMd5Hex(SECRET_KEY, body);
+  const sig  = hmacMd5LuaCompat(SECRET_KEY, body);
   res.set('X-Resp-Sig', sig);
   res.type('application/json').send(body);
 }
-// ⬆⬆⬆
-// Маппинг: имя скрипта -> путь в GitLab
+
+// Отправить text/plain с подписью (для /load)
+function signedText(res, text) {
+  const sig = hmacMd5LuaCompat(SECRET_KEY, text);
+  res.set('X-Resp-Sig', sig);
+  res.type('text/plain').send(text);
+}
 const SCRIPT_REGISTRY = {
   "kaelis.gs": "test12.lua",
   // добавляйте другие скрипты
@@ -644,9 +669,8 @@ app.post('/load', async (req, res) => {
     console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip} | Size=${encryptedScript.length}b`);
     await logActivity('load_success', ip, tdata.hwid, tdata.key, tdata.script_name);
     
-    const sig = hmacMd5Hex(SECRET_KEY, encryptedScript);
-    res.set('X-Resp-Sig', sig);
-    res.type('text/plain').send(encryptedScript);
+    signedText(res, encryptedScript);
+
 
   } catch (e) {
     console.error("❌ LOAD ERROR:", e);
