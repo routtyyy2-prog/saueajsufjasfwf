@@ -578,7 +578,7 @@ app.post('/auth', async (req, res) => {
       ua, 
       key: keyEntry.key_name,
       script_name,
-      expires: now + 5000,  // Ñ‚Ð¾ÐºÐµÐ½ Ð¶Ð¸Ð²ÐµÑ‚ 5 ÑÐµÐºÑƒÐ½Ð´
+      expires: now + 15000,  // Ñ‚Ð¾ÐºÐµÐ½ Ð¶Ð¸Ð²ÐµÑ‚ 5 ÑÐµÐºÑƒÐ½Ð´
       used: false, 
       created: now 
     };
@@ -844,6 +844,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
