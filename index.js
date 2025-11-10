@@ -88,42 +88,102 @@ const pool = new Pool({
 pool.on('error', (err) => {
   console.error('âŒ PostgreSQL pool error:', err);
 });
-async function runMigrations() {
-  await pool.query(`
-  CREATE TABLE IF NOT EXISTS keys (
-    key_name TEXT PRIMARY KEY,
-    hwid TEXT DEFAULT NULL,
-    expires BIGINT NOT NULL,
-    scripts JSONB DEFAULT '[]',
-    banned BOOLEAN DEFAULT FALSE,
-    ban_reason TEXT,
-    banned_at BIGINT,
-    banned_hwid TEXT,
-    banned_ip TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS banned_hwids (
-    hwid TEXT PRIMARY KEY,
-    reason TEXT,
-    banned_at BIGINT,
-    banned_by_key TEXT,
-    banned_ip TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS activity_log (
-    id BIGSERIAL PRIMARY KEY,
-    event_type TEXT,
-    ip TEXT,
-    hwid TEXT,
-    key_name TEXT,
-    details TEXT,
-    timestamp BIGINT
-  );
-  `);
-  console.log('âœ… DB migrations applied');
+async function dropSchemaObjects() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // порядок на случай будущих FK:
+    await client.query('DROP TABLE IF EXISTS activity_log   CASCADE;');
+    await client.query('DROP TABLE IF EXISTS banned_hwids   CASCADE;');
+    await client.query('DROP TABLE IF EXISTS keys           CASCADE;');
+    await client.query('COMMIT');
+    console.log('✅ Dropped tables: keys, banned_hwids, activity_log');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ Drop failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
 }
+
+async function createNeededTables() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS keys (
+        key_name    TEXT PRIMARY KEY,
+        hwid        TEXT DEFAULT NULL,
+        expires     BIGINT NOT NULL,
+        scripts     JSONB DEFAULT '[]',
+        banned      BOOLEAN DEFAULT FALSE,
+        ban_reason  TEXT,
+        banned_at   BIGINT,
+        banned_hwid TEXT,
+        banned_ip   TEXT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS banned_hwids (
+        hwid        TEXT PRIMARY KEY,
+        reason      TEXT,
+        banned_at   BIGINT,
+        banned_by_key TEXT,
+        banned_ip   TEXT
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id        BIGSERIAL PRIMARY KEY,
+        event_type TEXT,
+        ip         TEXT,
+        hwid       TEXT,
+        key_name   TEXT,
+        details    TEXT,
+        timestamp  BIGINT
+      );
+    `);
+
+    // полезные индексы
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_expires ON keys(expires);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_banned  ON keys(banned);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_log_ts       ON activity_log(timestamp);`);
+
+    await client.query('COMMIT');
+    console.log('✅ Created required tables');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ Create tables failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// старое имя оставим как thin-wrapper для обратной совместимости
+async function runMigrations() {
+  // «мягкая» миграция без дропа — если нужно оставить данные
+  await createNeededTables();
+}
+
+// новый инициализатор с режимом
+async function initializeSchema() {
+  if (INIT_MODE === 'reset') {
+    console.warn('⚠ INIT_MODE=reset — dropping tables…');
+    await dropSchemaObjects();
+    await createNeededTables();
+  } else {
+    console.log('ℹ INIT_MODE=migrate — ensuring tables exist…');
+    await runMigrations();
+  }
+}
+
 
 const tokens = new Map();
 const nonces = new Map();
@@ -955,7 +1015,7 @@ app.use((req,res)=>res.status(404).json({error:'Not found'}));
 
 // === START ===
 app.listen(PORT, async () => {
-  await runMigrations();
+  await initializeSchema();
   console.log(`\nðŸ”’ ============================================`);
   console.log(`   ULTRA SECURE LOADER v5.0 (PostgreSQL)`);
   console.log(`   ============================================`);
@@ -978,6 +1038,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
