@@ -400,23 +400,20 @@ function chunkAndStore(scriptId, code) {
   const padded = addGlobalPadding(code);
   const buffer = Buffer.from(padded, 'utf8');
 
-  // Разбиваем на реальные чанки
   const realChunks = [];
   for (let i = 0; i < buffer.length; i += CHUNK_SIZE) {
     realChunks.push(buffer.subarray(i, i + CHUNK_SIZE));
   }
 
-  // Добавляем фейковые чанки
   const fakeCount = Math.floor(realChunks.length * FAKE_CHUNK_RATIO);
   const allChunks = [...realChunks];
-  
+
   for (let i = 0; i < fakeCount; i++) {
     const fakeChunk = generateFakeChunk(CHUNK_SIZE);
     const insertPos = Math.floor(Math.random() * allChunks.length);
     allChunks.splice(insertPos, 0, fakeChunk);
   }
 
-  // Сохраняем карту реальных индексов
   const realIndices = [];
   let realIdx = 0;
   for (let i = 0; i < allChunks.length; i++) {
@@ -428,17 +425,38 @@ function chunkAndStore(scriptId, code) {
 
   const hash = crypto.createHash('sha256').update(code).digest('hex');
 
+  // >>> ДОБАВЛЕНО: контрольные суммы для валидации на клиенте
+  const GLOBAL_PAD_BYTES = 64;                  // addGlobalPadding кладёт hex(32) = 64 байта по краям
+  const assembly_md5     = md5(code);           // md5 исходного кода БЕЗ глобального паддинга
+  const assembly_len     = Buffer.byteLength(code, 'utf8');
+
+  // md5 каждого real-чанка (plain, до шифрования), ключ — глобальный индекс в allChunks
+  const chunk_md5 = {};
+  for (let i = 0; i < realIndices.length; i++) {
+    const idx = realIndices[i];                 // позиция real чанка внутри allChunks
+    chunk_md5[String(idx)] = md5(allChunks[idx]);
+  }
+  // <<< ДОБАВЛЕНО
+
   SCRIPT_CHUNKS.set(scriptId, {
     chunks: allChunks,
     realIndices,
     totalReal: realChunks.length,
     totalWithFakes: allChunks.length,
     hash,
-    size: code.length
+    size: code.length,
+
+    // >>> ДОБАВЛЕНО
+    assembly_md5,
+    assembly_len,
+    global_pad: GLOBAL_PAD_BYTES,
+    chunk_md5
+    // <<< ДОБАВЛЕНО
   });
 
   console.log(`✅ ${scriptId}: ${realChunks.length} real + ${fakeCount} fake = ${allChunks.length} total chunks (${code.length} bytes, sha256=${hash.slice(0, 8)}…)`);
 }
+
 
 async function prepareAllScripts() {
   console.log('\n📦 Preparing scripts (from env)…');
@@ -802,9 +820,21 @@ app.post('/script/meta', async (req, res) => {
     
     signedJson(res, {
       total_chunks: scriptData.totalReal,
-      real_indices: realOrder.join(','), // Только реальные индексы в специальном порядке
+      real_indices: realOrder.join(','),   // как и было (клиент уже парсит числа)
       script_hash: scriptData.hash,
-      chunk_interdep: true // Флаг что чанки зависят друг от друга
+      chunk_interdep: true,
+    
+      // >>> ДОБАВЛЕНО
+      global_pad: scriptData.global_pad,         // 64
+      assembly_md5: scriptData.assembly_md5,     // md5 plain-кода без паддинга
+      assembly_len: scriptData.assembly_len,     // длина plain-кода
+      // chunk_md5: вернём только для нужных индексов пользователя (их порядок выше)
+      chunk_md5: (function () {
+        const obj = {};
+        for (const idx of realOrder) obj[idx] = scriptData.chunk_md5[String(idx)];
+        return obj;
+      })()
+      // <<< ДОБАВЛЕНО
     });
   } catch (e) {
     console.error('❌ Meta error:', e);
@@ -861,7 +891,7 @@ app.post('/script/chunk', async (req, res) => {
     
     // Вычисляем хеш текущего чанка для chain-проверки
     const chunkHash = md5(b64 + hwid + idx);
-
+    const plain_md5 = md5(part);
     if ((idx + 1) % 16 === 0) {
       await logActivity('chunk_load', sessResult.rows[0].discord_id, hwid, ip, `${script_id}:${idx}`);
     }
@@ -872,10 +902,12 @@ app.post('/script/chunk', async (req, res) => {
     signedJson(res, {
       chunk: b64,
       chunk_id: idx,
-      chunk_hash: chunkHash, // Для проверки цепочки
+      chunk_hash: chunkHash,
+      plain_md5,                 // >>> ДОБАВЛЕНО
       encoding: 'base64',
       cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'advanced-xor'
     });
+
   } catch (e) {
     console.error('❌ Chunk error:', e);
     res.status(500).json({ error: 'Internal error' });
@@ -1326,3 +1358,4 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
