@@ -26,7 +26,15 @@ const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 const INIT_MODE = (process.env.INIT_MODE || "migrate").toLowerCase(); // "migrate" | "reset"
-
+const BOT_ADMIN_TOKEN = process.env.BOT_ADMIN_TOKEN || "";
+function requireBotAdmin(req, res) {
+  const tok = String(req.body?.admin_token || '');
+  if (!BOT_ADMIN_TOKEN || tok !== BOT_ADMIN_TOKEN) {
+    res.status(403).json({ error: 'Forbidden' });
+    return false;
+  }
+  return true;
+}
 function md5hex(s) {
   return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
@@ -251,22 +259,19 @@ async function createNeededTables() {
 
 async function initializeSchema() {
   console.log(`ℹ INIT_MODE=${INIT_MODE}`);
+
   if (INIT_MODE === 'reset') {
+    // Жёсткий сброс схемы с фолбэком
     try {
       await hardResetPublicSchema();
-    } catch (e) {
+    } catch {
       console.warn('⚠ hardResetPublicSchema unavailable, trying fallback…');
       await dropAllObjectsFallback();
     }
     await createNeededTables();
     return;
   }
-  if (INIT_MODE === 'reset') {
-    // мягкий дроп известных таблиц
-    await dropAllObjectsFallback(); // можно оставить только keys/banned_hwids/activity_log если хочешь мягче
-    await createNeededTables();
-    return;
-  }
+
   // migrate (по умолчанию) — просто ensure
   await createNeededTables();
 }
@@ -1095,7 +1100,57 @@ app.post('/report_tamper', async (req, res) => {
 
   res.json({ status: 'banned', message: 'Your key has been permanently banned' });
 });
+app.post('/bot/create-key', async (req, res) => {
+  try {
+    if (!requireBotAdmin(req, res)) return;
 
+    const days   = parseInt(req.body?.days, 10);
+    const scripts= Array.isArray(req.body?.scripts) ? req.body.scripts : [];
+    const note   = req.body?.note || null;
+
+    if (!days || days < 1 || days > 365) return res.status(400).json({ error: 'Bad days' });
+
+    const keyName = require('crypto').randomBytes(8).toString('hex').toUpperCase();
+    const expires = Math.floor(Date.now() / 1000) + days * 86400; // сек
+
+    await pool.query(`
+      INSERT INTO keys (key_name, hwid, expires, scripts, banned, ban_reason, created_at, updated_at)
+      VALUES ($1, NULL, $2, $3, FALSE, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `, [keyName, expires, JSON.stringify(scripts)]);
+
+    return res.json({
+      key: keyName,
+      days,
+      expires_at: expires * 1000,
+      scripts,
+      note
+    });
+  } catch (e) {
+    console.error('create-key error:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// /bot/revoke-key — пометить ключ забаненным (лоадер перестанет пускать)
+app.post('/bot/revoke-key', async (req, res) => {
+  try {
+    if (!requireBotAdmin(req, res)) return;
+    const key = String(req.body?.key || '');
+    if (!key) return res.status(400).json({ error: 'Missing key' });
+
+    const r = await pool.query(
+      `UPDATE keys SET banned = TRUE, ban_reason = COALESCE($2,'revoked'), updated_at = CURRENT_TIMESTAMP
+       WHERE LOWER(key_name)=LOWER($1)`,
+      [key, req.body?.reason || null]
+    );
+
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Key not found' });
+    return res.json({ ok: true, updated: r.rowCount });
+  } catch (e) {
+    console.error('revoke-key error:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
 // === BLOCK INVALID ===
 app.get('/auth', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /auth'); res.status(405).json({error:'POST only'}); });
 app.get('/load', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /load'); res.status(405).json({error:'POST only'}); });
@@ -1126,6 +1181,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
