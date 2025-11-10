@@ -678,6 +678,80 @@ app.post('/load', async (req, res) => {
     res.status(500).json({ error: 'Internal error' });
   }
 });
+function splitTextRandom(text, parts = 50) {
+  const chunkSize = Math.ceil(text.length / parts);
+  const chunks = [];
+  for (let i = 0; i < parts; i++) {
+    const start = i * chunkSize;
+    const end = start + chunkSize;
+    chunks.push(text.slice(start, end));
+  }
+  return chunks.sort(() => Math.random() - 0.5); // случайный порядок
+}
+
+app.post('/load_split', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token } = req.body || {};
+
+  if (!token) {
+    await logSuspiciousActivity(ip, null, null, 'No token');
+    return res.status(400).json({ error: 'No token' });
+  }
+
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+
+  if (!tdata) {
+    await logSuspiciousActivity(ip, null, null, 'Invalid token');
+    return res.status(403).json({ error: 'Bad token' });
+  }
+
+  if (Date.now() > tdata.expires) {
+    tokens.delete(tokenHash);
+    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token expired');
+    return res.status(403).json({ error: 'Expired' });
+  }
+
+  if (tdata.used) {
+    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token reuse', true);
+    await sendAlert(`**🚨 TOKEN REUSE**\nKey: \`${tdata.key}\`\nHWID: \`${tdata.hwid}\`\nIP: \`${ip}\``, 'critical');
+    return res.status(403).json({ error: 'Token used' });
+  }
+
+  tdata.used = true;
+
+  try {
+    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
+    if (!scriptPath) {
+      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Unknown script');
+      return res.status(404).json({ error: 'Script not found' });
+    }
+
+    const scriptCode = await fetchGitLabScript(scriptPath);
+    if (!scriptCode) {
+      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Script fetch failed');
+      return res.status(502).json({ error: 'Upstream error' });
+    }
+
+    // 🔐 Разделение скрипта на 50 частей, шифрование и подпись
+    const chunks = splitTextRandom(scriptCode, 50).map((c, i) => {
+      const enc = xorEncrypt(c, tdata.hwid);
+      return {
+        idx: i + 1,
+        data: enc,
+        sig: hmacMd5LuaCompat(SECRET_KEY, enc)
+      };
+    });
+
+    signedJson(res, { chunks });
+    console.log(`✅ Script delivered in ${chunks.length} chunks to ${ip}`);
+
+  } catch (e) {
+    console.error("❌ LOAD_SPLIT ERROR:", e);
+    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'LoadSplit error: ' + e.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
 
 
 // === TAMPER REPORT ===
@@ -741,3 +815,4 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
