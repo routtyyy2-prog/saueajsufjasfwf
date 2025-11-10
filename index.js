@@ -689,6 +689,29 @@ function splitTextRandom(text, parts = 50) {
   return chunks.sort(() => Math.random() - 0.5); // случайный порядок
 }
 
+// аккуратно режем БЕЗ перемешивания
+function splitTextDeterministic(text, parts = 50) {
+  const out = [];
+  const chunkSize = Math.ceil(text.length / parts);
+  for (let i = 0; i < parts; i++) {
+    const start = i * chunkSize;
+    const end = start + chunkSize;
+    out.push(text.slice(start, end));
+  }
+  // обрезаем пустышки с хвоста
+  while (out.length && out[out.length - 1].length === 0) out.pop();
+  return out;
+}
+
+// честная тасовка Фишера—Йетса
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 app.post('/load_split', async (req, res) => {
   const ip = getClientIP(req);
   const { token } = req.body || {};
@@ -714,7 +737,7 @@ app.post('/load_split', async (req, res) => {
 
   if (tdata.used) {
     await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token reuse', true);
-    await sendAlert(`**🚨 TOKEN REUSE**\nKey: \`${tdata.key}\`\nHWID: \`${tdata.hwid}\`\nIP: \`${ip}\``, 'critical');
+    await sendAlert(`**TOKEN REUSE**\nKey: \`${tdata.key}\`\nHWID: \`${tdata.hwid}\`\nIP: \`${ip}\``, 'critical');
     return res.status(403).json({ error: 'Token used' });
   }
 
@@ -733,18 +756,24 @@ app.post('/load_split', async (req, res) => {
       return res.status(502).json({ error: 'Upstream error' });
     }
 
-    // 🔐 Разделение скрипта на 50 частей, шифрование и подпись
-    const chunks = splitTextRandom(scriptCode, 50).map((c, i) => {
-      const enc = xorEncrypt(c, tdata.hwid);
+    // 1) режем и нумеруем по исходному порядку
+    const slices = splitTextDeterministic(scriptCode, 50);
+
+    // 2) шифруем и подписываем КАЖДУЮ часть
+    const items = slices.map((plain, i) => {
+      const enc = xorEncrypt(plain, tdata.hwid);
       return {
-        idx: i + 1,
+        idx: i + 1,                      // <-- индекс правильного порядка
         data: enc,
         sig: hmacMd5LuaCompat(SECRET_KEY, enc)
       };
     });
 
-    signedJson(res, { chunks });
-    console.log(`✅ Script delivered in ${chunks.length} chunks to ${ip}`);
+    // 3) только теперь перемешиваем объекты
+    shuffleInPlace(items);
+
+    signedJson(res, { chunks: items });
+    console.log(`✅ Script delivered in ${items.length} chunks to ${ip}`);
 
   } catch (e) {
     console.error("❌ LOAD_SPLIT ERROR:", e);
@@ -815,4 +844,5 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
