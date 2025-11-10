@@ -580,6 +580,30 @@ function unsealFromToken(token, blob, sig) {
     return { error: 'Decrypt fail' };
   }
 }
+function sealAuth(hwid, obj) {
+  const json = JSON.stringify(obj);
+  const blob = xorEncrypt(json, hwid);                  // шифруем от HWID
+  const sig  = hmacMd5LuaCompat(SECRET_KEY, hwid + blob); // подпись от сервера
+  return { blob, sig };
+}
+
+function unsealAuth(hwid, blob, sig) {
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, hwid + blob);
+  if (expSig !== sig) return { error: 'Bad sig' };
+
+  // расшифровка «зеркалом» xorEncrypt
+  try {
+    const tb = Buffer.from(blob, 'base64');
+    const kb = Buffer.from(hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    const fullText = res.toString('utf8');
+    const padLen = 32; // 16 байт hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { obj: JSON.parse(plain) };
+  } catch { return { error: 'Decrypt fail' }; }
+}
 
 // === RATE LIMIT ===
 const globalLimiter = rateLimit({
@@ -797,6 +821,90 @@ app.post('/auth', async (req, res) => {
     console.error("âŒ AUTH ERROR:", e);
     await logSuspiciousActivity(ip, hwid, key, 'Server error');
     res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.post('/auth_x', async (req, res) => {
+  const ip = getClientIP(req);
+  const ua = req.headers['user-agent'] || 'unknown';
+  const { hwid, blob, sig, client_cert_fp } = req.body || {};
+
+  // анти-MITM/пининги как в /auth
+  const mitmIndicators = detectMITM(req);
+  if (mitmIndicators.length > 0) return res.status(403).json({ error: 'Proxy detected' });
+  if (client_cert_fp && EXPECTED_CERT_FINGERPRINT && !constantTimeCompare(client_cert_fp, EXPECTED_CERT_FINGERPRINT)) {
+    await logSuspiciousActivity(ip, hwid, null, 'Certificate mismatch', true);
+    return res.status(403).json({ error: 'Invalid certificate' });
+  }
+
+  try {
+    if (!hwid || !blob || !sig) return res.status(400).json({ error: 'Missing params' });
+
+    const un = unsealAuth(hwid, blob, sig);
+    if (un.error) return res.status(403).json({ error: un.error });
+
+    const { key, script_name, timestamp, nonce, fp } = un.obj || {};
+    if (!key || !script_name || !timestamp || !nonce) return res.status(400).json({ error: 'Missing fields' });
+
+    // опционально сверить client fp из payload
+    const expectedFp = md5(`${hwid}:${nonce}:${SECRET_CHECKSUM}`);
+    if (!constantTimeCompare(expectedFp, fp || expectedFp)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Bad FP (blob)', true);
+      return res.status(403).json({ error: 'Bad FP' });
+    }
+
+    // остальная логика — 1:1 как в /auth (бан, рейтлимит, таймстамп/реплей)
+    if (await isHwidBanned(hwid)) return res.status(403).json({ error: 'Banned' });
+    if (!checkHwidRateLimit(hwid)) return res.status(429).json({ error: 'Too many requests' });
+
+    const reqTime = parseInt(timestamp);
+    const now = Date.now();
+    if (isNaN(reqTime) || Math.abs(now - reqTime) > 30000) return res.status(403).json({ error: 'Timestamp' });
+
+    const nonceKey = `${hwid}:${timestamp}:${nonce}`;
+    if (nonces.has(nonceKey)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Replay attack', true);
+      return res.status(403).json({ error: 'Replay' });
+    }
+    nonces.set(nonceKey, now);
+
+    // подпись как раньше
+    const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+    if (!constantTimeCompare(un.obj.signature || '', expectedSig)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Bad sig');
+      return res.status(403).json({ error: 'Bad sig' });
+    }
+
+    // проверка ключа/скрипта/срока/привязка HWID (тож самое что в /auth)
+    const keyEntry = await getKeyByName(key);
+    if (!keyEntry) return res.status(403).json({ error: 'Invalid key' });
+    if (keyEntry.banned) return res.status(403).json({ error: 'Banned key' });
+
+    const keyExpiry = parseInt(keyEntry.expires) || 0;
+    if (keyExpiry === 0 || Math.floor(now / 1000) >= keyExpiry) return res.status(403).json({ error: 'Expired' });
+
+    const keyHwid = String(keyEntry.hwid || "*");
+    if (keyHwid === "*" || keyHwid === "" || keyHwid === null) await updateKeyHwid(keyEntry.key_name, hwid);
+    else if (keyHwid !== hwid) return res.status(403).json({ error: 'HWID mismatch' });
+
+    if (!checkScriptAllowed(keyEntry, script_name)) return res.status(403).json({ error: 'Script not allowed' });
+
+    // выдаём токен (как в /auth)
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = sha256(token);
+    const tokenData = { hwid, ip, ua, key: keyEntry.key_name, script_name, expires: now + 15000, used: false, created: now };
+    tokens.set(tokenHash, tokenData);
+
+    // но ответ - тоже «запечатанный»
+    const out = sealAuth(hwid, {
+      token: xorEncrypt(token, hwid),  // можешь и прямо token, но так совместимо
+      expires_in: 5,
+      server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
+    });
+    return signedJson(res, out);
+
+  } catch (e) {
+    await logSuspiciousActivity(ip, hwid, null, 'Server error');
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -1181,6 +1289,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
