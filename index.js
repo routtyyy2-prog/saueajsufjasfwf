@@ -69,8 +69,9 @@ function hmacMd5(key, msg) {
   }
   
   const inner = md5hex(ipad + msg);
-  return md5hex(opad + inner);
+  return md5hex(opad + inner);  // Возвращает HEX строку
 }
+
 
 function hmacMd5Buf(keyBuf, dataBuf) {
   return crypto.createHmac('md5', keyBuf).update(dataBuf).digest();
@@ -122,33 +123,44 @@ class RC4 {
 // RC4 ENCRYPTION FUNCTION
 // ═══════════════════════════════════════════════════════════════
 function rc4EncryptChunk(buffer, hwid, chunkIndex) {
-  // Debug mode - return plain data
   if (DEBUG_PLAIN) {
     const plain = Buffer.concat([Buffer.from('PLAIN0'), buffer]);
     return plain.toString('base64');
   }
 
-  // Generate RC4 key: md5(SECRET_KEY:hwid:chunkIndex) -> hex -> bytes
   const keyHex = md5hex(`${SECRET_KEY}:${hwid}:${chunkIndex}`);
   const keyBuf = Buffer.from(keyHex, 'hex');
 
-  // Add 16-byte padding on both sides
   const prefix = crypto.randomBytes(16);
   const postfix = crypto.randomBytes(16);
   const padded = Buffer.concat([prefix, buffer, postfix]);
 
-  // RC4 encrypt with 1024-byte keystream drop
   const rc4 = new RC4(keyBuf);
   rc4.drop(1024);
   const encrypted = rc4.crypt(padded);
 
-  // HMAC-MD5(SECRET_KEY, encrypted || "hwid:chunkIndex") → 16 bytes
-  const meta = Buffer.from(`${hwid}:${chunkIndex}`, 'utf8');
-  const hmac = hmacMd5Buf(Buffer.from(SECRET_KEY, 'utf8'), Buffer.concat([encrypted, meta]));
+  // ПРАВИЛЬНЫЙ HMAC: используем тот же метод что в Lua
+  // Lua делает: hmac_md5(SECRET_KEY, encrypted_string .. meta_string)
+  
+  // Шаг 1: конвертируем encrypted в строку (binary encoding сохраняет байты)
+  const encryptedStr = encrypted.toString('binary');
+  
+  // Шаг 2: создаём meta строку
+  const metaStr = `${hwid}:${chunkIndex}`;
+  
+  // Шаг 3: конкатенируем как строки
+  const messageStr = encryptedStr + metaStr;
+  
+  // Шаг 4: вычисляем HMAC-MD5 используя строковую функцию
+  // (та же что определена выше в коде)
+  const hmacHex = hmacMd5(SECRET_KEY, messageStr);
+  
+  // Шаг 5: конвертируем hex в Buffer (16 байт)
+  const hmacBuf = Buffer.from(hmacHex, 'hex');
 
-  // Final packet: [encrypted][hmac16] -> base64
-  return Buffer.concat([encrypted, hmac]).toString('base64');
+  return Buffer.concat([encrypted, hmacBuf]).toString('base64');
 }
+
 
 function encryptChunk(data, hwid, chunkIndex) {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
@@ -1043,3 +1055,4 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
