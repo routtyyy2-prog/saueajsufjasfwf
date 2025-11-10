@@ -94,30 +94,33 @@ function constantTimeCompare(a, b) {
 // ═══════════════════════════════════════════════════════════════
 // ADVANCED XOR OBFUSCATION (без Brotli)
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// FIXED ADVANCED XOR OBFUSCATION
+// ═══════════════════════════════════════════════════════════════
 function advancedXorObfuscate(buffer, hwid, chunkIndex) {
   if (process.env.DISABLE_ENC === '1') {
     return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
   }
 
-  // Генерируем ключи на основе SECRET_KEY + HWID + chunk index
+  // Generate keys based on SECRET_KEY + HWID + chunk index
   const key1 = md5(SECRET_KEY + hwid + 'xor1' + chunkIndex);
   const key2 = md5(SECRET_KEY + hwid + 'xor2' + chunkIndex);
   const key3 = md5(SECRET_KEY + hwid + 'xor3' + chunkIndex);
   const shuffleKey = md5(SECRET_KEY + hwid + 'shuffle' + chunkIndex);
   
-  // Добавляем случайный префикс (16 байт)
+  // Add random prefix (16 bytes)
   const prefix = crypto.randomBytes(16);
   let data = Buffer.concat([prefix, buffer]);
   
-  // Слой 1: XOR с key1 + позиционный сдвиг
+  // Layer 1: XOR with key1 + positional shift (using i-1 for 0-based indexing)
   const key1Bytes = Buffer.from(key1, 'hex');
   for (let i = 0; i < data.length; i++) {
     const keyIdx = i % key1Bytes.length;
-    const posShift = (i * 7 + chunkIndex) % 256; // Зависит от позиции и индекса чанка
+    const posShift = ((i) * 7 + chunkIndex) % 256; // Use i (not i-1) to match client
     data[i] ^= key1Bytes[keyIdx] ^ posShift;
   }
   
-  // Слой 2: Байтовое перемешивание
+  // Layer 2: Byte shuffling
   const shuffled = Buffer.alloc(data.length);
   const shuffleBytes = Buffer.from(shuffleKey, 'hex');
   
@@ -127,14 +130,14 @@ function advancedXorObfuscate(buffer, hwid, chunkIndex) {
     shuffled[newPos] = data[i];
   }
   
-  // Слой 3: XOR с key2 в обратном порядке
+  // Layer 3: XOR with key2 in reverse order
   const key2Bytes = Buffer.from(key2, 'hex');
   for (let i = 0; i < shuffled.length; i++) {
     const keyIdx = (shuffled.length - i - 1) % key2Bytes.length;
     shuffled[i] ^= key2Bytes[keyIdx];
   }
   
-  // Слой 4: Блочное XOR с key3
+  // Layer 4: Block XOR with key3
   const key3Bytes = Buffer.from(key3, 'hex');
   const blockSize = 16;
   for (let i = 0; i < shuffled.length; i += blockSize) {
@@ -144,12 +147,13 @@ function advancedXorObfuscate(buffer, hwid, chunkIndex) {
     }
   }
   
-  // Добавляем случайный постфикс (16 байт)
+  // Add random postfix (16 bytes)
   const postfix = crypto.randomBytes(16);
   const final = Buffer.concat([shuffled, postfix]);
   
   return final.toString('base64');
 }
+
 
 function encryptChunk(data, hwid, chunkIndex) {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
@@ -1358,4 +1362,5 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
