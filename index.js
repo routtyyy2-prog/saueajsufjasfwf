@@ -139,27 +139,34 @@ function rc4EncryptChunk(buffer, hwid, chunkIndex) {
   rc4.drop(1024);
   const encrypted = rc4.crypt(padded);
 
-  // ПРАВИЛЬНЫЙ HMAC: используем тот же метод что в Lua
-  // Lua делает: hmac_md5(SECRET_KEY, encrypted_string .. meta_string)
+  // ============================================================
+  // ПРАВИЛЬНЫЙ HMAC совместимый с Lua клиентом
+  // ============================================================
   
-  // Шаг 1: конвертируем encrypted в строку (binary encoding сохраняет байты)
-  const encryptedStr = encrypted.toString('binary');
+  // Lua код делает:
+  // local data_for_hmac = encrypted .. meta_str
+  // local hmac_hex = hmac_md5(SECRET_KEY, data_for_hmac)
   
-  // Шаг 2: создаём meta строку
+  // Где hmac_md5 работает со строками (binary strings)
+  
+  // Конвертируем encrypted Buffer в binary string (сохраняет байты 1:1)
+  let encryptedBinary = '';
+  for (let i = 0; i < encrypted.length; i++) {
+    encryptedBinary += String.fromCharCode(encrypted[i]);
+  }
+  
   const metaStr = `${hwid}:${chunkIndex}`;
+  const messageForHmac = encryptedBinary + metaStr;
   
-  // Шаг 3: конкатенируем как строки
-  const messageStr = encryptedStr + metaStr;
+  // Используем существующую строковую функцию hmacMd5
+  const hmacHex = hmacMd5(SECRET_KEY, messageForHmac);
   
-  // Шаг 4: вычисляем HMAC-MD5 используя строковую функцию
-  // (та же что определена выше в коде)
-  const hmacHex = hmacMd5(SECRET_KEY, messageStr);
-  
-  // Шаг 5: конвертируем hex в Buffer (16 байт)
+  // Конвертируем hex обратно в Buffer
   const hmacBuf = Buffer.from(hmacHex, 'hex');
 
   return Buffer.concat([encrypted, hmacBuf]).toString('base64');
 }
+
 
 
 function encryptChunk(data, hwid, chunkIndex) {
@@ -1055,4 +1062,5 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
