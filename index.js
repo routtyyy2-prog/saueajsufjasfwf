@@ -97,34 +97,63 @@ function constantTimeCompare(a, b) {
 // ═══════════════════════════════════════════════════════════════
 // FIXED ADVANCED XOR OBFUSCATION
 // ═══════════════════════════════════════════════════════════════
+// Добавь это на СЕРВЕРЕ для тестирования одного чанка
+// Вставь в функцию advancedXorObfuscate
+
 function advancedXorObfuscate(buffer, hwid, chunkIndex) {
-  if (DEBUG_PLAIN) {
-    console.log(`[DEBUG] Plain chunk ${chunkIndex}, len=${buffer.length}, md5=${md5(buffer)}`);
-    return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
+  const isTestChunk = chunkIndex === 0; // логируем chunk 0
+  
+  if (isTestChunk) {
+    console.log('\n========== SERVER ENCRYPT CHUNK 0 ==========');
+    console.log('hwid:', hwid);
+    console.log('chunkIndex:', chunkIndex);
+    console.log('buffer length:', buffer.length);
+    console.log('buffer MD5:', crypto.createHash('md5').update(buffer).digest('hex'));
   }
-  if (process.env.DISABLE_ENC === '1') {
+
+  if (DEBUG_PLAIN) {
+    console.log(`[DEBUG] Plain chunk ${chunkIndex}, len=${buffer.length}, md5=${crypto.createHash('md5').update(buffer).digest('hex')}`);
     return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
   }
 
-  // Generate keys based on SECRET_KEY + HWID + chunk index
-  const key1 = md5(SECRET_KEY + hwid + 'xor1' + chunkIndex);
-  const key2 = md5(SECRET_KEY + hwid + 'xor2' + chunkIndex);
-  const key3 = md5(SECRET_KEY + hwid + 'xor3' + chunkIndex);
-  const shuffleKey = md5(SECRET_KEY + hwid + 'shuffle' + chunkIndex);
+  // Generate keys
+  const key1 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor1' + chunkIndex).digest('hex');
+  const key2 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor2' + chunkIndex).digest('hex');
+  const key3 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor3' + chunkIndex).digest('hex');
+  const shuffleKey = crypto.createHash('md5').update(SECRET_KEY + hwid + 'shuffle' + chunkIndex).digest('hex');
   
-  // Add random prefix (16 bytes)
-  const prefix = crypto.randomBytes(16);
+  if (isTestChunk) {
+    console.log('\n--- KEYS ---');
+    console.log('key1:', key1);
+    console.log('key2:', key2);
+    console.log('key3:', key3);
+    console.log('shuffle:', shuffleKey);
+  }
+  
+  // Add prefix
+  const prefix = isTestChunk ? Buffer.alloc(16, 0xAA) : crypto.randomBytes(16); // для теста делаем фиксированный
   let data = Buffer.concat([prefix, buffer]);
   
-  // Layer 1: XOR with key1 + positional shift (using i-1 for 0-based indexing)
+  if (isTestChunk) {
+    console.log('\n--- AFTER PREFIX ---');
+    console.log('Length:', data.length);
+    console.log('First 32 bytes:', data.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
+  }
+  
+  // Layer 1
   const key1Bytes = Buffer.from(key1, 'hex');
   for (let i = 0; i < data.length; i++) {
     const keyIdx = i % key1Bytes.length;
-    const posShift = ((i) * 7 + chunkIndex) % 256; // Use i (not i-1) to match client
+    const posShift = (i * 7 + chunkIndex) % 256;
     data[i] ^= key1Bytes[keyIdx] ^ posShift;
   }
   
-  // Layer 2: Byte shuffling
+  if (isTestChunk) {
+    console.log('\n--- AFTER LAYER 1 ---');
+    console.log('First 32 bytes:', data.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
+  }
+  
+  // Layer 2: Shuffling
   const shuffled = Buffer.alloc(data.length);
   const shuffleBytes = Buffer.from(shuffleKey, 'hex');
   
@@ -134,14 +163,24 @@ function advancedXorObfuscate(buffer, hwid, chunkIndex) {
     shuffled[newPos] = data[i];
   }
   
-  // Layer 3: XOR with key2 in reverse order
+  if (isTestChunk) {
+    console.log('\n--- AFTER LAYER 2 (SHUFFLE) ---');
+    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
+  }
+  
+  // Layer 3
   const key2Bytes = Buffer.from(key2, 'hex');
   for (let i = 0; i < shuffled.length; i++) {
     const keyIdx = (shuffled.length - i - 1) % key2Bytes.length;
     shuffled[i] ^= key2Bytes[keyIdx];
   }
   
-  // Layer 4: Block XOR with key3
+  if (isTestChunk) {
+    console.log('\n--- AFTER LAYER 3 ---');
+    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
+  }
+  
+  // Layer 4
   const key3Bytes = Buffer.from(key3, 'hex');
   const blockSize = 16;
   for (let i = 0; i < shuffled.length; i += blockSize) {
@@ -151,13 +190,26 @@ function advancedXorObfuscate(buffer, hwid, chunkIndex) {
     }
   }
   
-  // Add random postfix (16 bytes)
-  const postfix = crypto.randomBytes(16);
+  if (isTestChunk) {
+    console.log('\n--- AFTER LAYER 4 ---');
+    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
+  }
+  
+  // Add postfix
+  const postfix = isTestChunk ? Buffer.alloc(16, 0xBB) : crypto.randomBytes(16);
   const final = Buffer.concat([shuffled, postfix]);
+  
+  if (isTestChunk) {
+    console.log('\n--- FINAL ---');
+    console.log('Total length:', final.length);
+    const b64 = final.toString('base64');
+    console.log('Base64 length:', b64.length);
+    console.log('Base64 (first 100):', b64.substring(0, 100));
+    console.log('========================================\n');
+  }
   
   return final.toString('base64');
 }
-
 
 function encryptChunk(data, hwid, chunkIndex) {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
@@ -1365,6 +1417,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
