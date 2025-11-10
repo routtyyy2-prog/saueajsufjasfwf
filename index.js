@@ -1,7 +1,7 @@
 // ╔════════════════════════════════════════════════════════════════╗
-// ║  ULTRA SECURE LOADER V3.0 - DISCORD AUTH + CHUNKED LOADING    ║
+// ║  ULTRA SECURE LOADER V3.1 - MULTI-LAYER ENCRYPTION            ║
 // ║  • Discord OAuth2 authentication                               ║
-// ║  • Chunked script delivery (random order, AES encrypted)       ║
+// ║  • Multi-layer obfuscation encryption                          ║
 // ║  • HWID binding per Discord account                            ║
 // ║  • Anti-debugging & anti-tampering                             ║
 // ╚════════════════════════════════════════════════════════════════╝
@@ -24,7 +24,7 @@ const AGENT_HTTPS = new https.Agent({ keepAlive: true, maxSockets: 80 });
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
-app.use(express.static('public')); // для OAuth callback страницы
+app.use(express.static('public'));
 
 // ═══════════════════════════════════════════════════════════════
 // CONFIG
@@ -34,8 +34,9 @@ const SECRET_KEY = process.env.SECRET_KEY || "k8Jf2mP9xLq4nR7vW3sT6yH5bN8aZ1cD";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const DISCORD_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '16324', 10); // 8КБ по умолчанию
-const CHUNK_RPS  = parseInt(process.env.CHUNK_RPS  || '120', 10);  // лимит запросов/сек на /script/chunk
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '16324', 10);
+const CHUNK_RPS  = parseInt(process.env.CHUNK_RPS  || '120', 10);
+
 const chunkLimiter = rateLimit({
   windowMs: 1000,
   max: CHUNK_RPS,
@@ -43,6 +44,7 @@ const chunkLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Slow down chunk requests' }
 });
+
 // Discord OAuth2
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
@@ -90,48 +92,53 @@ function constantTimeCompare(a, b) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// AES-256-GCM ENCRYPTION (для chunks)
+// MULTI-LAYER ENCRYPTION
 // ═══════════════════════════════════════════════════════════════
-function aesEncrypt(text, hwid) {
-  // Можно временно выключить шифрование: DISABLE_ENC=1 (для отладки)
+function multiLayerEncrypt(buffer, hwid) {
   if (process.env.DISABLE_ENC === '1') {
-    return Buffer.concat([Buffer.from('PLAIN0'), Buffer.from(text, 'utf8')]).toString('base64');
+    return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
   }
 
-  const key = crypto.pbkdf2Sync(
-    SECRET_KEY + hwid,
-    'loader_v3_salt',
-    100000,
-    32,
-    'sha256'
-  );
-
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-
-  // без лишнего паддинга
-  const encrypted = Buffer.concat([
-    cipher.update(Buffer.from(text, 'utf8')),
-    cipher.final()
-  ]);
-
-  const authTag = cipher.getAuthTag();
-  const combined = Buffer.concat([iv, encrypted, authTag]);
-
-  return combined.toString('base64');
-}
-function aesEncryptBuf(buf, hwid) {
-  if (process.env.DISABLE_ENC === '1') {
-    return Buffer.concat([Buffer.from('PLAIN0'), buf]).toString('base64');
+  const key1Hash = md5(SECRET_KEY + hwid + 'layer1');
+  const key2Hash = md5(SECRET_KEY + hwid + 'layer2');
+  const shuffleKey = md5(SECRET_KEY + hwid + 'shuffle');
+  
+  // Layer 1: Add random salt
+  const salt = crypto.randomBytes(16);
+  let data = Buffer.concat([salt, buffer]);
+  
+  // Layer 2: XOR with key1
+  const key1Bytes = Buffer.from(key1Hash, 'hex');
+  for (let i = 0; i < data.length; i++) {
+    const keyIdx = i % key1Bytes.length;
+    const offset = (i % 256);
+    data[i] ^= key1Bytes[keyIdx] ^ offset;
   }
-  const key = crypto.pbkdf2Sync(SECRET_KEY + hwid, 'loader_v3_salt', 100000, 32, 'sha256');
-  const iv  = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const enc = Buffer.concat([cipher.update(buf), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, enc, tag]).toString('base64');
+  
+  // Layer 3: Byte shuffle
+  const shuffled = Buffer.alloc(data.length);
+  const shuffleBytes = Buffer.from(shuffleKey, 'hex');
+  
+  for (let i = 0; i < data.length; i++) {
+    const shuffleIdx = shuffleBytes[i % shuffleBytes.length];
+    const newPos = (i + shuffleIdx) % data.length;
+    shuffled[newPos] = data[i];
+  }
+  
+  // Layer 4: XOR with key2
+  const key2Bytes = Buffer.from(key2Hash, 'hex');
+  for (let i = 0; i < shuffled.length; i++) {
+    const keyIdx = (shuffled.length - i - 1) % key2Bytes.length;
+    shuffled[i] ^= key2Bytes[keyIdx];
+  }
+  
+  return shuffled.toString('base64');
 }
 
+function encryptChunk(data, hwid) {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+  return multiLayerEncrypt(buffer, hwid);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // POSTGRESQL
@@ -243,8 +250,6 @@ async function runMigrations() {
   }
 }
 
-
-
 // ═══════════════════════════════════════════════════════════════
 // DISCORD ALERTS
 // ═══════════════════════════════════════════════════════════════
@@ -268,7 +273,7 @@ async function sendAlert(message, level = 'warning') {
           description: message,
           color: colors[level] || colors.warning,
           timestamp: new Date().toISOString(),
-          footer: { text: 'Secure Loader V3' }
+          footer: { text: 'Secure Loader V3.1' }
         }]
       })
     });
@@ -307,12 +312,12 @@ async function logActivity(eventType, discordId, hwid, ip, details) {
 // SCRIPT CHUNKING SYSTEM
 // ═══════════════════════════════════════════════════════════════
 const SCRIPT_CHUNKS = new Map();
+
 function addGlobalPadding(code) {
   const pad = crypto.randomBytes(32).toString('hex');
   return pad + code + pad;
 }
 
-// ускоренный fetch
 async function fetchWithRetries(url, opts = {}, attempts = 4) {
   let err;
   const agent = url.startsWith('https') ? AGENT_HTTPS : AGENT_HTTP;
@@ -320,7 +325,7 @@ async function fetchWithRetries(url, opts = {}, attempts = 4) {
     try {
       const res = await fetch(url, {
         agent,
-        headers: { 'User-Agent': 'secure-loader/3.0', ...(opts.headers || {}) },
+        headers: { 'User-Agent': 'secure-loader/3.1', ...(opts.headers || {}) },
         ...opts,
       });
       if (res.ok) return res;
@@ -333,7 +338,6 @@ async function fetchWithRetries(url, opts = {}, attempts = 4) {
   throw err;
 }
 
-// получение lua-кода с gitlab/raw
 async function getScriptCodeFromEnv() {
   const RAW_URL   = process.env.REPO_RAW_URL || '';
   const PROJ_ID   = process.env.GITLAB_PROJECT_ID || '';
@@ -357,36 +361,33 @@ async function getScriptCodeFromEnv() {
   throw new Error('No source configured: set GITLAB_* or REPO_RAW_URL');
 }
 
-// основная функция разрезки и хранения чанков
 function chunkAndStore(scriptId, code) {
   const padded = addGlobalPadding(code);
-  const compressed = zlib.brotliCompressSync(Buffer.from(padded, 'utf8')); // сжимаем весь lua
+  const compressed = zlib.brotliCompressSync(Buffer.from(padded, 'utf8'));
 
   const chunks = [];
   for (let i = 0; i < compressed.length; i += CHUNK_SIZE) {
-    chunks.push(compressed.subarray(i, i + CHUNK_SIZE)); // режем по байтам
+    chunks.push(compressed.subarray(i, i + CHUNK_SIZE));
   }
 
   const hash = crypto.createHash('sha256').update(code).digest('hex');
 
   SCRIPT_CHUNKS.set(scriptId, {
-    chunks,                // массив Buffer
-    total: chunks.length,  // количество чанков
-    hash,                  // sha256 от исходного lua
-    size: code.length,     // исходный текст
-    br_size: compressed.length // сжатый размер
+    chunks,
+    total: chunks.length,
+    hash,
+    size: code.length,
+    br_size: compressed.length
   });
 
   console.log(`✅ ${scriptId}: ${chunks.length} chunks (br=${compressed.length} bytes, raw=${code.length}, sha256=${hash.slice(0, 8)}…)`);
 }
 
-// загрузка lua и разрезка
 async function prepareAllScripts() {
   console.log('\n📦 Preparing scripts (from env)…');
   const code = await getScriptCodeFromEnv();
   chunkAndStore('kaelis.gs', code);
 }
-
 
 // ═══════════════════════════════════════════════════════════════
 // RATE LIMITING
@@ -397,13 +398,11 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth attempts' }
 });
 
-
-
 app.use('/auth/discord', authLimiter);
 app.use('/script/chunk', chunkLimiter);
 
 // ═══════════════════════════════════════════════════════════════
-// CLEANUP (every 5 min)
+// CLEANUP
 // ═══════════════════════════════════════════════════════════════
 setInterval(async () => {
   const now = Date.now();
@@ -419,8 +418,9 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════════
-// HEALTH CHECK
+// ROUTES
 // ═══════════════════════════════════════════════════════════════
+
 app.get('/health', async (req, res) => {
   try {
     const client = await pool.connect();
@@ -430,9 +430,10 @@ app.get('/health', async (req, res) => {
     res.json({
       status: 'online',
       database: 'connected',
-      version: '3.0',
+      version: '3.1',
       scripts_loaded: SCRIPT_CHUNKS.size,
-      auth_method: 'discord_oauth2'
+      auth_method: 'discord_oauth2',
+      encryption: 'multi-layer'
     });
   } catch (e) {
     res.status(500).json({
@@ -443,9 +444,6 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// DISCORD OAUTH2 - STEP 1: Initiate Login
-// ═══════════════════════════════════════════════════════════════
 app.post('/auth/discord/init', async (req, res) => {
   const ip = getClientIP(req);
   const { hwid, timestamp, nonce, signature } = req.body || {};
@@ -454,7 +452,6 @@ app.post('/auth/discord/init', async (req, res) => {
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
-  // Verify signature
   const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
   if (!constantTimeCompare(signature, expectedSig)) {
     await logActivity('oauth_init_failed', null, hwid, ip, 'Bad signature');
@@ -462,18 +459,15 @@ app.post('/auth/discord/init', async (req, res) => {
   }
   
   try {
-    // Generate OAuth state
     const state = crypto.randomBytes(32).toString('hex');
     const statePayload = md5(state + hwid + OAUTH_STATE_SECRET);
     
-    // Store state
     await pool.query(
       `INSERT INTO oauth_states (state, hwid, created_at, expires)
        VALUES ($1, $2, $3, $4)`,
-      [statePayload, hwid, Date.now(), Date.now() + 5 * 60 * 1000] // 5 min expiry
+      [statePayload, hwid, Date.now(), Date.now() + 5 * 60 * 1000]
     );
     
-    // Generate Discord OAuth URL
     const params = new URLSearchParams({
       client_id: DISCORD_CLIENT_ID,
       redirect_uri: DISCORD_REDIRECT_URI,
@@ -497,9 +491,6 @@ app.post('/auth/discord/init', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// DISCORD OAUTH2 - STEP 2: Handle Callback
-// ═══════════════════════════════════════════════════════════════
 app.get('/auth/discord/callback', async (req, res) => {
   const { code, state } = req.query;
   
@@ -508,7 +499,6 @@ app.get('/auth/discord/callback', async (req, res) => {
   }
   
   try {
-    // Verify state
     const stateResult = await pool.query(
       'SELECT hwid FROM oauth_states WHERE state = $1 AND expires > $2',
       [state, Date.now()]
@@ -520,7 +510,6 @@ app.get('/auth/discord/callback', async (req, res) => {
     
     const hwid = stateResult.rows[0].hwid;
     
-    // Exchange code for token
     const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -539,7 +528,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       return res.send('<h1>❌ Failed to get access token</h1>');
     }
     
-    // Get user info
     const userResponse = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` }
     });
@@ -550,7 +538,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       return res.send('<h1>❌ Failed to get user info</h1>');
     }
     
-    // Check if user exists and has subscription
     const userResult = await pool.query(
       'SELECT * FROM users WHERE discord_id = $1',
       [userData.id]
@@ -566,7 +553,6 @@ app.get('/auth/discord/callback', async (req, res) => {
     
     const user = userResult.rows[0];
     
-    // Check banned
     if (user.banned) {
       return res.send(`
         <h1>❌ Account banned</h1>
@@ -574,7 +560,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       `);
     }
     
-    // Check subscription
     if (user.subscription_expires < Date.now()) {
       return res.send(`
         <h1>❌ Subscription expired</h1>
@@ -582,7 +567,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       `);
     }
     
-    // Check HWID
     if (user.hwid && user.hwid !== hwid) {
       return res.send(`
         <h1>❌ HWID Mismatch</h1>
@@ -592,7 +576,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       `);
     }
     
-    // Bind HWID if first time
     if (!user.hwid) {
       await pool.query(
         'UPDATE users SET hwid = $1, updated_at = CURRENT_TIMESTAMP WHERE discord_id = $2',
@@ -607,9 +590,8 @@ app.get('/auth/discord/callback', async (req, res) => {
       );
     }
     
-    // Create session
     const sessionId = generateToken(32);
-    const sessionExp = Date.now() + (24 * 60 * 60 * 1000); // 24h
+    const sessionExp = Date.now() + (24 * 60 * 60 * 1000);
     
     await pool.query(
       `INSERT INTO sessions (session_id, discord_id, hwid, expires, last_heartbeat, ip)
@@ -617,18 +599,15 @@ app.get('/auth/discord/callback', async (req, res) => {
       [sessionId, userData.id, hwid, sessionExp, Date.now(), getClientIP(req)]
     );
     
-    // Update last login
     await pool.query(
       'UPDATE users SET last_login = $1, discord_username = $2, discord_avatar = $3 WHERE discord_id = $4',
       [Date.now(), userData.username, userData.avatar, userData.id]
     );
     
-    // Delete used state
     await pool.query('DELETE FROM oauth_states WHERE state = $1', [state]);
     
     await logActivity('login_success', userData.id, hwid, getClientIP(req), userData.username);
     
-    // Return success page with session data (loader will poll /auth/discord/poll)
     res.send(`
       <!DOCTYPE html>
       <html>
@@ -649,7 +628,6 @@ app.get('/auth/discord/callback', async (req, res) => {
         </div>
         <p>You can close this window now.</p>
         <script>
-          // Store session for polling
           localStorage.setItem('loader_session', JSON.stringify({
             session_id: '${sessionId}',
             expires: ${sessionExp},
@@ -666,9 +644,6 @@ app.get('/auth/discord/callback', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// DISCORD OAUTH2 - STEP 3: Poll for Session
-// ═══════════════════════════════════════════════════════════════
 app.post('/auth/discord/poll', async (req, res) => {
   const { hwid, timestamp, nonce, signature } = req.body || {};
   
@@ -682,7 +657,6 @@ app.post('/auth/discord/poll', async (req, res) => {
   }
   
   try {
-    // Check if session exists for this HWID
     const result = await pool.query(
       `SELECT s.session_id, s.expires, u.discord_username, u.subscription_expires, u.scripts
        FROM sessions s
@@ -714,9 +688,6 @@ app.post('/auth/discord/poll', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// SCRIPT META (chunk info)
-// ═══════════════════════════════════════════════════════════════
 app.post('/script/meta', async (req, res) => {
   const ip = getClientIP(req);
   const { session_id, script_id, hwid, timestamp, nonce, signature } = req.body || {};
@@ -737,7 +708,6 @@ app.post('/script/meta', async (req, res) => {
   }
   
   try {
-    // Validate session
     const sessResult = await pool.query(
       `SELECT s.discord_id, u.scripts, u.banned
        FROM sessions s
@@ -756,25 +726,21 @@ app.post('/script/meta', async (req, res) => {
       return res.status(403).json({ error: 'Account banned' });
     }
     
-    // Check script access
     const allowedScripts = session.scripts || [];
     if (!allowedScripts.includes(script_id)) {
       return res.status(403).json({ error: 'Script not allowed' });
     }
     
-    // Get chunks
     const scriptData = SCRIPT_CHUNKS.get(script_id);
     if (!scriptData) {
       return res.status(404).json({ error: 'Script not found' });
     }
     
-    // Generate RANDOM chunk order (anti-Fiddler)
     const chunkOrder = [];
     for (let i = 1; i <= scriptData.total; i++) {
       chunkOrder.push(i);
     }
     
-    // Fisher-Yates shuffle
     for (let i = chunkOrder.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [chunkOrder[i], chunkOrder[j]] = [chunkOrder[j], chunkOrder[i]];
@@ -793,9 +759,6 @@ app.post('/script/meta', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// SCRIPT CHUNK (get single chunk)
-// ═══════════════════════════════════════════════════════════════
 app.post('/script/chunk', async (req, res) => {
   const ip = getClientIP(req);
   const { session_id, script_id, chunk_id, hwid, timestamp, nonce, signature } = req.body || {};
@@ -826,15 +789,13 @@ app.post('/script/chunk', async (req, res) => {
     if (isNaN(idx) || idx < 0 || idx >= scriptData.total)
       return res.status(400).json({ error: 'Invalid chunk_id' });
 
-    // Берём ГОТОВЫЙ brotli-кусок и шифруем как есть
-    const part = scriptData.chunks[idx]; // Buffer
-    const b64  = aesEncryptBuf(part, hwid);
+    const part = scriptData.chunks[idx];
+    const b64  = encryptChunk(part, hwid);
 
     if ((idx + 1) % 16 === 0) {
       await logActivity('chunk_load', sessResult.rows[0].discord_id, hwid, ip, `${script_id}:${idx+1}`);
     }
 
-    // мелкие анти-прокси заголовки (по желанию)
     res.set('Cache-Control', 'no-store');
     res.set('X-Chunk-Id', String(idx+1));
 
@@ -843,7 +804,7 @@ app.post('/script/chunk', async (req, res) => {
       chunk_id: idx + 1,
       encoding: 'base64',
       compression: 'br',
-      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'aes-256-gcm'
+      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'multi-layer'
     });
   } catch (e) {
     console.error('❌ Chunk error:', e);
@@ -879,9 +840,8 @@ app.post('/script/bundle', async (req, res) => {
     const scriptData = SCRIPT_CHUNKS.get(script_id);
     if (!scriptData) return res.status(404).json({ error: 'Script not found' });
 
-    // уже brotli-куски → собираем в единый поток
     const fullBr = Buffer.concat(scriptData.chunks);
-    const encryptedB64 = aesEncryptBuf(fullBr, hwid);
+    const encryptedB64 = encryptChunk(fullBr, hwid);
 
     await logActivity('bundle_load', session.discord_id, hwid, ip, `${script_id}:${scriptData.size}`);
 
@@ -889,7 +849,7 @@ app.post('/script/bundle', async (req, res) => {
       bundle: encryptedB64,
       encoding: 'base64',
       compression: 'br',
-      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'aes-256-gcm',
+      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'multi-layer',
       script_hash: scriptData.hash,
       total_size: scriptData.size
     });
@@ -899,10 +859,6 @@ app.post('/script/bundle', async (req, res) => {
   }
 });
 
-
-// ═══════════════════════════════════════════════════════════════
-// HEARTBEAT
-// ═══════════════════════════════════════════════════════════════
 app.post('/heartbeat', async (req, res) => {
   const { session_id, active_scripts } = req.body || {};
   
@@ -925,7 +881,6 @@ app.post('/heartbeat', async (req, res) => {
     
     const discordId = result.rows[0].discord_id;
     
-    // Check if banned
     const userResult = await pool.query(
       'SELECT banned FROM users WHERE discord_id = $1',
       [discordId]
@@ -942,9 +897,6 @@ app.post('/heartbeat', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// TAMPER REPORT
-// ═══════════════════════════════════════════════════════════════
 app.post('/report/tamper', async (req, res) => {
   const ip = getClientIP(req);
   const { hwid, session_id, reason } = req.body || {};
@@ -966,7 +918,6 @@ app.post('/report/tamper', async (req, res) => {
       }
     }
     
-    // Ban user
     if (discordId) {
       await pool.query(
         `UPDATE users 
@@ -975,7 +926,6 @@ app.post('/report/tamper', async (req, res) => {
         [reason, discordId]
       );
       
-      // Kill sessions
       await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discordId]);
     }
     
@@ -998,9 +948,6 @@ app.post('/report/tamper', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// SESSION END
-// ═══════════════════════════════════════════════════════════════
 app.post('/session/end', async (req, res) => {
   const { session_id } = req.body || {};
   
@@ -1016,8 +963,9 @@ app.post('/session/end', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// BOT API - Create User
+// BOT API
 // ═══════════════════════════════════════════════════════════════
+
 app.post('/bot/create-key', async (req, res) => {
   const { admin_token, days, scripts, uses, expires_in_days, note } = req.body || {};
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
@@ -1027,7 +975,7 @@ app.post('/bot/create-key', async (req, res) => {
     return res.status(400).json({ error: 'days required' });
   }
   try {
-    const keyId = crypto.randomBytes(16).toString('hex'); // сам ключ
+    const keyId = crypto.randomBytes(16).toString('hex');
     const usesLeft = Math.max(1, parseInt(uses || 1, 10));
     const expiresAt = expires_in_days ? (Date.now() + expires_in_days * 24 * 60 * 60 * 1000) : null;
     const scriptsList = Array.isArray(scripts) && scripts.length ? scripts : ['kaelis.gs'];
@@ -1051,6 +999,7 @@ app.post('/bot/create-key', async (req, res) => {
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
 app.post('/bot/revoke-key', async (req, res) => {
   const { admin_token, key } = req.body || {};
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
@@ -1077,7 +1026,6 @@ app.post('/bot/redeem-key', async (req, res) => {
   }
 
   try {
-    // Находим ключ
     const now = Date.now();
     const k = await pool.query(
       `SELECT * FROM invite_keys WHERE key_id = $1`, [key]
@@ -1096,7 +1044,6 @@ app.post('/bot/redeem-key', async (req, res) => {
     const days = keyRow.days;
     const scripts = keyRow.scripts || ['kaelis.gs'];
 
-    // Пользователь есть?
     const u = await pool.query('SELECT * FROM users WHERE discord_id = $1', [discord_id]);
 
     let newExpires;
@@ -1105,7 +1052,6 @@ app.post('/bot/redeem-key', async (req, res) => {
       const base = Math.max(user.subscription_expires || 0, now);
       newExpires = base + days * 24 * 60 * 60 * 1000;
 
-      // обновляем
       await pool.query(
         `UPDATE users
          SET subscription_expires = $1,
@@ -1126,7 +1072,6 @@ app.post('/bot/redeem-key', async (req, res) => {
       );
     }
 
-    // уменьшаем использований
     await pool.query(
       `UPDATE invite_keys
        SET uses_left = uses_left - 1
@@ -1146,9 +1091,6 @@ app.post('/bot/redeem-key', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// BOT API - Check User Info
-// ═══════════════════════════════════════════════════════════════
 app.post('/bot/check-user', async (req, res) => {
   const { admin_token, discord_id } = req.body || {};
   
@@ -1190,9 +1132,6 @@ app.post('/bot/check-user', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// BOT API - Reset HWID
-// ═══════════════════════════════════════════════════════════════
 app.post('/bot/reset-hwid', async (req, res) => {
   const { admin_token, discord_id } = req.body || {};
   
@@ -1220,7 +1159,6 @@ app.post('/bot/reset-hwid', async (req, res) => {
       return res.status(403).json({ error: 'No resets left' });
     }
     
-    // Reset HWID
     await pool.query(
       `UPDATE users 
        SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1, updated_at = CURRENT_TIMESTAMP
@@ -1228,7 +1166,6 @@ app.post('/bot/reset-hwid', async (req, res) => {
       [discord_id]
     );
     
-    // Kill all sessions
     await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discord_id]);
     
     await sendAlert(
@@ -1248,9 +1185,6 @@ app.post('/bot/reset-hwid', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// BOT API - Extend Subscription
-// ═══════════════════════════════════════════════════════════════
 app.post('/bot/extend-sub', async (req, res) => {
   const { admin_token, discord_id, days } = req.body || {};
   
@@ -1298,9 +1232,6 @@ app.post('/bot/extend-sub', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// BOT API - Ban/Unban User
-// ═══════════════════════════════════════════════════════════════
 app.post('/bot/ban-user', async (req, res) => {
   const { admin_token, discord_id, ban, reason } = req.body || {};
   
@@ -1320,7 +1251,6 @@ app.post('/bot/ban-user', async (req, res) => {
       [ban, reason || null, discord_id]
     );
     
-    // Kill all sessions if banning
     if (ban) {
       await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discord_id]);
     }
@@ -1339,9 +1269,6 @@ app.post('/bot/ban-user', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// 404 Handler
-// ═══════════════════════════════════════════════════════════════
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
@@ -1351,12 +1278,12 @@ app.use((req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.listen(PORT, async () => {
   console.log(`\n🔐 ═══════════════════════════════════════════`);
-  console.log(`   ULTRA SECURE LOADER V3.0 (Discord Auth)`);
+  console.log(`   ULTRA SECURE LOADER V3.1`);
   console.log(`   ═══════════════════════════════════════════`);
   console.log(`   ✅ Port: ${PORT}`);
   console.log(`   ✅ Database: PostgreSQL`);
   console.log(`   ✅ Auth: Discord OAuth2 (HWID lock)`);
-  console.log(`   ✅ AES-256-GCM: ENABLED`);
+  console.log(`   ✅ Encryption: Multi-Layer`);
   console.log(`   ✅ Chunked Loading: ENABLED`);
   console.log(`   ✅ Heartbeat: 3s intervals`);
   console.log(`═══════════════════════════════════════════\n`);
@@ -1376,10 +1303,3 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
-
-
-
-
-
-
-
