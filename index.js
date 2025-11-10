@@ -14,6 +14,12 @@ const { Pool } = require('pg');
 const fs = require('fs').promises;
 const path = require('path');
 const fetch = require('node-fetch');
+const zlib = require('zlib');
+const http = require('http');
+const https = require('https');
+
+const AGENT_HTTP  = new http.Agent({ keepAlive: true, maxSockets: 80 });
+const AGENT_HTTPS = new https.Agent({ keepAlive: true, maxSockets: 80 });
 
 const app = express();
 app.set('trust proxy', 1);
@@ -28,7 +34,15 @@ const SECRET_KEY = process.env.SECRET_KEY || "k8Jf2mP9xLq4nR7vW3sT6yH5bN8aZ1cD";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const DISCORD_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '16324', 10); // 8КБ по умолчанию
+const CHUNK_RPS  = parseInt(process.env.CHUNK_RPS  || '120', 10);  // лимит запросов/сек на /script/chunk
+const chunkLimiter = rateLimit({
+  windowMs: 1000,
+  max: CHUNK_RPS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Slow down chunk requests' }
+});
 // Discord OAuth2
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
@@ -79,8 +93,11 @@ function constantTimeCompare(a, b) {
 // AES-256-GCM ENCRYPTION (для chunks)
 // ═══════════════════════════════════════════════════════════════
 function aesEncrypt(text, hwid) {
-  const algorithm = 'aes-256-gcm';
-  
+  // Можно временно выключить шифрование: DISABLE_ENC=1 (для отладки)
+  if (process.env.DISABLE_ENC === '1') {
+    return Buffer.concat([Buffer.from('PLAIN0'), Buffer.from(text, 'utf8')]).toString('base64');
+  }
+
   const key = crypto.pbkdf2Sync(
     SECRET_KEY + hwid,
     'loader_v3_salt',
@@ -88,22 +105,33 @@ function aesEncrypt(text, hwid) {
     32,
     'sha256'
   );
-  
+
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(algorithm, key, iv);
-  
-  // Добавляем padding для обфускации размера
-  const padding = crypto.randomBytes(32).toString('hex');
-  const paddedText = padding + text + padding;
-  
-  let encrypted = cipher.update(paddedText, 'utf8');
-  encrypted = Buffer.concat([encrypted, cipher.final()]);
-  
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+  // без лишнего паддинга
+  const encrypted = Buffer.concat([
+    cipher.update(Buffer.from(text, 'utf8')),
+    cipher.final()
+  ]);
+
   const authTag = cipher.getAuthTag();
   const combined = Buffer.concat([iv, encrypted, authTag]);
-  
+
   return combined.toString('base64');
 }
+function aesEncryptBuf(buf, hwid) {
+  if (process.env.DISABLE_ENC === '1') {
+    return Buffer.concat([Buffer.from('PLAIN0'), buf]).toString('base64');
+  }
+  const key = crypto.pbkdf2Sync(SECRET_KEY + hwid, 'loader_v3_salt', 100000, 32, 'sha256');
+  const iv  = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(buf), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, enc, tag]).toString('base64');
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // POSTGRESQL
@@ -278,82 +306,41 @@ async function logActivity(eventType, discordId, hwid, ip, details) {
 // ═══════════════════════════════════════════════════════════════
 // SCRIPT CHUNKING SYSTEM
 // ═══════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════
-// SCRIPT CHUNKING SYSTEM (загрузка напрямую с GitLab RAW URL)
-// ═══════════════════════════════════════════════════════════════
 const SCRIPT_CHUNKS = new Map();
-
-/**
- * Загружает Lua-скрипт с GitLab RAW-ссылки и разбивает его на чанки.
- */
-async function loadAndChunkFromGit(scriptId, rawUrl) {
-  try {
-    console.log(`📡 Fetching ${scriptId} from GitLab RAW...`);
-    const res = await fetch(rawUrl);
-
-    if (!res.ok) {
-      console.error(`❌ Failed to fetch ${scriptId}: ${res.status} ${res.statusText}`);
-      return false;
-    }
-
-    const scriptCode = await res.text();
-
-    // === Разбиваем на чанки ===
-    const CHUNK_SIZE = 500; // можешь менять размер
-    const chunks = [];
-
-    for (let i = 0; i < scriptCode.length; i += CHUNK_SIZE) {
-      chunks.push(scriptCode.substring(i, i + CHUNK_SIZE));
-    }
-
-    const hash = crypto.createHash('sha256').update(scriptCode).digest('hex');
-
-    SCRIPT_CHUNKS.set(scriptId, {
-      chunks,
-      total: chunks.length,
-      hash,
-      size: scriptCode.length
-    });
-
-    console.log(`✅ ${scriptId}: ${chunks.length} chunks (${scriptCode.length} bytes, sha256=${hash.slice(0, 8)}…)`);
-    return true;
-  } catch (e) {
-    console.error(`❌ Error loading ${scriptId}:`, e.message);
-    return false;
-  }
+function addGlobalPadding(code) {
+  const pad = crypto.randomBytes(32).toString('hex');
+  return pad + code + pad;
 }
 
-/**
- * Подготовка всех скриптов.
- * Здесь ты указываешь URL каждого скрипта.
- */
+// ускоренный fetch
 async function fetchWithRetries(url, opts = {}, attempts = 4) {
   let err;
+  const agent = url.startsWith('https') ? AGENT_HTTPS : AGENT_HTTP;
   for (let i = 0; i < attempts; i++) {
     try {
       const res = await fetch(url, {
-        headers: { 'User-Agent': 'secure-loader/3.0', ...(opts.headers||{}) },
+        agent,
+        headers: { 'User-Agent': 'secure-loader/3.0', ...(opts.headers || {}) },
         ...opts,
       });
       if (res.ok) return res;
-      if (![403,429,500,502,503,504].includes(res.status)) {
+      if (![403, 429, 500, 502, 503, 504].includes(res.status))
         throw new Error(`${res.status} ${res.statusText}`);
-      }
       err = new Error(`${res.status} ${res.statusText}`);
     } catch (e) { err = e; }
-    await new Promise(r => setTimeout(r, 250 * 2**i));
+    await new Promise(r => setTimeout(r, 250 * (2 ** i)));
   }
   throw err;
 }
 
+// получение lua-кода с gitlab/raw
 async function getScriptCodeFromEnv() {
-  const RAW_URL   = process.env.REPO_RAW_URL || '';            // твоя переменная
+  const RAW_URL   = process.env.REPO_RAW_URL || '';
   const PROJ_ID   = process.env.GITLAB_PROJECT_ID || '';
   const FILE_PATH = process.env.GITLAB_FILE_PATH || 'test12.lua';
   const REF       = process.env.GITLAB_BRANCH || 'main';
   const TOKEN     = process.env.GITLAB_TOKEN || '';
 
-  // 1) Приватный репо через GitLab API
   if (PROJ_ID && FILE_PATH && TOKEN) {
     const encPath = encodeURIComponent(FILE_PATH);
     const api = `https://gitlab.com/api/v4/projects/${PROJ_ID}/repository/files/${encPath}/raw?ref=${encodeURIComponent(REF)}`;
@@ -361,7 +348,6 @@ async function getScriptCodeFromEnv() {
     return await res.text();
   }
 
-  // 2) Прямой RAW (если публичный или с заголовком PRIVATE-TOKEN)
   if (RAW_URL) {
     const headers = TOKEN ? { 'PRIVATE-TOKEN': TOKEN } : {};
     const res = await fetchWithRetries(RAW_URL, { headers });
@@ -371,18 +357,33 @@ async function getScriptCodeFromEnv() {
   throw new Error('No source configured: set GITLAB_* or REPO_RAW_URL');
 }
 
+// основная функция разрезки и хранения чанков
 function chunkAndStore(scriptId, code) {
-  const CHUNK_SIZE = 500;
+  const padded = addGlobalPadding(code);
+  const compressed = zlib.brotliCompressSync(Buffer.from(padded, 'utf8')); // сжимаем весь lua
+
   const chunks = [];
-  for (let i = 0; i < code.length; i += CHUNK_SIZE) chunks.push(code.slice(i, i + CHUNK_SIZE));
+  for (let i = 0; i < compressed.length; i += CHUNK_SIZE) {
+    chunks.push(compressed.subarray(i, i + CHUNK_SIZE)); // режем по байтам
+  }
+
   const hash = crypto.createHash('sha256').update(code).digest('hex');
-  SCRIPT_CHUNKS.set(scriptId, { chunks, total: chunks.length, hash, size: code.length });
-  console.log(`✅ ${scriptId}: ${chunks.length} chunks (${code.length} bytes, sha256=${hash.slice(0,8)}…)`);
+
+  SCRIPT_CHUNKS.set(scriptId, {
+    chunks,                // массив Buffer
+    total: chunks.length,  // количество чанков
+    hash,                  // sha256 от исходного lua
+    size: code.length,     // исходный текст
+    br_size: compressed.length // сжатый размер
+  });
+
+  console.log(`✅ ${scriptId}: ${chunks.length} chunks (br=${compressed.length} bytes, raw=${code.length}, sha256=${hash.slice(0, 8)}…)`);
 }
 
+// загрузка lua и разрезка
 async function prepareAllScripts() {
   console.log('\n📦 Preparing scripts (from env)…');
-  const code = await getScriptCodeFromEnv(); // бросит ошибку если не смог
+  const code = await getScriptCodeFromEnv();
   chunkAndStore('kaelis.gs', code);
 }
 
@@ -802,68 +803,106 @@ app.post('/script/meta', async (req, res) => {
 app.post('/script/chunk', async (req, res) => {
   const ip = getClientIP(req);
   const { session_id, script_id, chunk_id, hwid, timestamp, nonce, signature } = req.body || {};
-  
-  if (!session_id || !script_id || !chunk_id || !hwid || !timestamp || !nonce || !signature) {
+  if (!session_id || !script_id || !chunk_id || !hwid || !timestamp || !nonce || !signature)
     return res.status(400).json({ error: 'Missing parameters' });
-  }
-  
+
   const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
-  if (!constantTimeCompare(signature, expectedSig)) {
+  if (!constantTimeCompare(signature, expectedSig))
     return res.status(403).json({ error: 'Invalid signature' });
-  }
-  
+
   const clientFp = req.headers['x-client-fp'];
   const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
-  if (!constantTimeCompare(clientFp, expectedFp)) {
+  if (!constantTimeCompare(clientFp, expectedFp))
     return res.status(403).json({ error: 'Invalid fingerprint' });
-  }
-  
+
   try {
-    // Validate session
     const sessResult = await pool.query(
       'SELECT discord_id FROM sessions WHERE session_id = $1 AND hwid = $2 AND expires > $3',
       [session_id, hwid, Date.now()]
     );
-    
-    if (sessResult.rows.length === 0) {
+    if (sessResult.rows.length === 0)
       return res.status(403).json({ error: 'Invalid session' });
-    }
-    
-    const discordId = sessResult.rows[0].discord_id;
-    
-    // Get chunk
+
     const scriptData = SCRIPT_CHUNKS.get(script_id);
-    if (!scriptData) {
-      return res.status(404).json({ error: 'Script not found' });
-    }
-    
-    const chunkIdNum = parseInt(chunk_id);
-    if (isNaN(chunkIdNum) || chunkIdNum < 1 || chunkIdNum > scriptData.total) {
+    if (!scriptData) return res.status(404).json({ error: 'Script not found' });
+
+    const idx = parseInt(chunk_id, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= scriptData.total)
       return res.status(400).json({ error: 'Invalid chunk_id' });
+
+    // Берём ГОТОВЫЙ brotli-кусок и шифруем как есть
+    const part = scriptData.chunks[idx]; // Buffer
+    const b64  = aesEncryptBuf(part, hwid);
+
+    if ((idx + 1) % 16 === 0) {
+      await logActivity('chunk_load', sessResult.rows[0].discord_id, hwid, ip, `${script_id}:${idx+1}`);
     }
-    
-    const chunkData = scriptData.chunks[chunkIdNum - 1];
-    if (!chunkData) {
-      return res.status(404).json({ error: 'Chunk not found' });
-    }
-    
-    // Encrypt with AES
-    const encrypted = aesEncrypt(chunkData, hwid);
-    
-    // Log every 10th chunk
-    if (chunkIdNum % 10 === 0) {
-      await logActivity('chunk_load', discordId, hwid, ip, `${script_id}:${chunk_id}`);
-    }
-    
+
+    // мелкие анти-прокси заголовки (по желанию)
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Chunk-Id', String(idx+1));
+
     signedJson(res, {
-      chunk: encrypted,
-      chunk_id: chunkIdNum
+      chunk: b64,
+      chunk_id: idx + 1,
+      encoding: 'base64',
+      compression: 'br',
+      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'aes-256-gcm'
     });
   } catch (e) {
     console.error('❌ Chunk error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
+app.post('/script/bundle', async (req, res) => {
+  const ip = getClientIP(req);
+  const { session_id, script_id, hwid, timestamp, nonce, signature } = req.body || {};
+  if (!session_id || !script_id || !hwid || !timestamp || !nonce || !signature)
+    return res.status(400).json({ error: 'Missing parameters' });
+
+  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  if (!constantTimeCompare(signature, expectedSig)) return res.status(403).json({ error: 'Invalid signature' });
+
+  const clientFp = req.headers['x-client-fp'];
+  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
+  if (!constantTimeCompare(clientFp, expectedFp)) return res.status(403).json({ error: 'Invalid fingerprint' });
+
+  try {
+    const sessResult = await pool.query(
+      `SELECT s.discord_id, u.scripts, u.banned
+       FROM sessions s JOIN users u ON u.discord_id = s.discord_id
+       WHERE s.session_id = $1 AND s.hwid = $2 AND s.expires > $3`,
+      [session_id, hwid, Date.now()]
+    );
+    if (sessResult.rows.length === 0) return res.status(403).json({ error: 'Invalid session' });
+    const session = sessResult.rows[0];
+    if (session.banned) return res.status(403).json({ error: 'Account banned' });
+    if (!session.scripts.includes(script_id)) return res.status(403).json({ error: 'Script not allowed' });
+
+    const scriptData = SCRIPT_CHUNKS.get(script_id);
+    if (!scriptData) return res.status(404).json({ error: 'Script not found' });
+
+    // уже brotli-куски → собираем в единый поток
+    const fullBr = Buffer.concat(scriptData.chunks);
+    const encryptedB64 = aesEncryptBuf(fullBr, hwid);
+
+    await logActivity('bundle_load', session.discord_id, hwid, ip, `${script_id}:${scriptData.size}`);
+
+    signedJson(res, {
+      bundle: encryptedB64,
+      encoding: 'base64',
+      compression: 'br',
+      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'aes-256-gcm',
+      script_hash: scriptData.hash,
+      total_size: scriptData.size
+    });
+  } catch (e) {
+    console.error('❌ Bundle error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
 
 // ═══════════════════════════════════════════════════════════════
 // HEARTBEAT
@@ -1341,6 +1380,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
