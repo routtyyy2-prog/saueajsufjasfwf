@@ -817,13 +817,12 @@ app.post('/script/meta', async (req, res) => {
     // Генерируем порядок загрузки на основе HWID
     const hwidSeed = parseInt(md5(hwid + script_id).substring(0, 8), 16);
     const realOrder = [...scriptData.realIndices];
-    
     // Перемешиваем порядок детерминированно на основе HWID
     for (let i = realOrder.length - 1; i > 0; i--) {
       const j = (hwidSeed + i) % (i + 1);
       [realOrder[i], realOrder[j]] = [realOrder[j], realOrder[i]];
     }
-    
+        
     await logActivity('script_meta', session.discord_id, hwid, ip, script_id);
     
     signedJson(res, {
@@ -1366,6 +1365,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
