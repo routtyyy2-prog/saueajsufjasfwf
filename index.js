@@ -28,7 +28,6 @@ const SECRET_KEY = process.env.SECRET_KEY || "k8Jf2mP9xLq4nR7vW3sT6yH5bN8aZ1cD";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-const SCRIPTS_DIR = process.env.SCRIPTS_DIR || './scripts';
 
 // Discord OAuth2
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
@@ -236,45 +235,66 @@ async function logActivity(eventType, discordId, hwid, ip, details) {
 // ═══════════════════════════════════════════════════════════════
 // SCRIPT CHUNKING SYSTEM
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// SCRIPT CHUNKING SYSTEM (загрузка напрямую с GitLab RAW URL)
+// ═══════════════════════════════════════════════════════════════
 const SCRIPT_CHUNKS = new Map();
 
-async function loadAndChunkScript(scriptId, filePath) {
+/**
+ * Загружает Lua-скрипт с GitLab RAW-ссылки и разбивает его на чанки.
+ */
+async function loadAndChunkFromGit(scriptId, rawUrl) {
   try {
-    const scriptCode = await fs.readFile(filePath, 'utf8');
-    
-    // Chunk size: 500 characters
-    const CHUNK_SIZE = 500;
+    console.log(`📡 Fetching ${scriptId} from GitLab RAW...`);
+    const res = await fetch(rawUrl);
+
+    if (!res.ok) {
+      console.error(`❌ Failed to fetch ${scriptId}: ${res.status} ${res.statusText}`);
+      return false;
+    }
+
+    const scriptCode = await res.text();
+
+    // === Разбиваем на чанки ===
+    const CHUNK_SIZE = 500; // можешь менять размер
     const chunks = [];
-    
+
     for (let i = 0; i < scriptCode.length; i += CHUNK_SIZE) {
       chunks.push(scriptCode.substring(i, i + CHUNK_SIZE));
     }
-    
-    const hash = crypto.createHash('md5').update(scriptCode).digest('hex');
-    
+
+    const hash = crypto.createHash('sha256').update(scriptCode).digest('hex');
+
     SCRIPT_CHUNKS.set(scriptId, {
-      chunks: chunks,
+      chunks,
       total: chunks.length,
-      hash: hash,
+      hash,
       size: scriptCode.length
     });
-    
-    console.log(`✅ ${scriptId}: ${chunks.length} chunks (${scriptCode.length} bytes)`);
+
+    console.log(`✅ ${scriptId}: ${chunks.length} chunks (${scriptCode.length} bytes, sha256=${hash.slice(0, 8)}…)`);
     return true;
   } catch (e) {
-    console.error(`❌ Failed to load ${scriptId}:`, e.message);
+    console.error(`❌ Error loading ${scriptId}:`, e.message);
     return false;
   }
 }
 
+/**
+ * Подготовка всех скриптов.
+ * Здесь ты указываешь URL каждого скрипта.
+ */
 async function prepareAllScripts() {
-  console.log('\n📦 Loading scripts...');
-  
-  // Load kaelis.gs (test12.lua)
-  await loadAndChunkScript('kaelis.gs', path.join(SCRIPTS_DIR, 'test12.lua'));
-  
-  // Add more scripts here
-  // await loadAndChunkScript('other.gs', path.join(SCRIPTS_DIR, 'other.lua'));
+  console.log('\n📦 Preparing scripts (remote)...');
+
+  // === твой скрипт ===
+  await loadAndChunkFromGit(
+    'kaelis.gs',
+    'https://gitlab.com/fwafsjafkawf0/fwafsjafkawf0koop/-/raw/main/test12.lua'
+  );
+
+  // можешь добавить другие:
+  // await loadAndChunkFromGit('another.gs', 'https://gitlab.com/.../another.lua');
 }
 
 // ═══════════════════════════════════════════════════════════════
