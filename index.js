@@ -121,87 +121,98 @@ pool.on('error', (err) => {
 });
 
 async function runMigrations() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      discord_id TEXT PRIMARY KEY,
-      discord_username TEXT,
-      discord_avatar TEXT,
-      hwid TEXT,
-      subscription_expires BIGINT NOT NULL,
-      max_hwid_resets INTEGER DEFAULT 3,
-      hwid_resets_used INTEGER DEFAULT 0,
-      scripts JSONB DEFAULT '["kaelis.gs"]',
-      banned BOOLEAN DEFAULT FALSE,
-      ban_reason TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      last_login BIGINT
-    );
-    
-    CREATE TABLE IF NOT EXISTS sessions (
-      session_id TEXT PRIMARY KEY,
-      discord_id TEXT NOT NULL,
-      hwid TEXT NOT NULL,
-      expires BIGINT NOT NULL,
-      last_heartbeat BIGINT,
-      active_scripts JSONB DEFAULT '[]',
-      ip TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS oauth_states (
-      state TEXT PRIMARY KEY,
-      hwid TEXT NOT NULL,
-      created_at BIGINT NOT NULL,
-      expires BIGINT NOT NULL
-    );
-    
-    CREATE TABLE IF NOT EXISTS activity_log (
-      id BIGSERIAL PRIMARY KEY,
-      event_type TEXT,
-      discord_id TEXT,
-      hwid TEXT,
-      ip TEXT,
-      details TEXT,
-      timestamp BIGINT
-    );
-    
-    CREATE INDEX IF NOT EXISTS idx_users_hwid ON users(hwid);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
-    CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_oauth_expires ON oauth_states(expires);
-  `);
-  console.log('✅ Database migrations applied');
-  await pool.query(`
-  -- одноразовые/многоразовые инвайт-ключи
-  CREATE TABLE IF NOT EXISTS invite_keys (
-    key_id TEXT PRIMARY KEY,
-    days INTEGER NOT NULL,
-    scripts JSONB DEFAULT '["kaelis.gs"]',
-    uses_left INTEGER DEFAULT 1,
-    created_by TEXT,
-    created_at BIGINT NOT NULL,
-    expires_at BIGINT, -- NULL = не истекает
-    note TEXT
-  );
+  const client = await pool.connect();
+  try {
+    console.log('🧨 Recreating database schema...');
+    await client.query('BEGIN');
 
-  CREATE INDEX IF NOT EXISTS idx_invite_expires ON invite_keys(expires_at);
-  CREATE INDEX IF NOT EXISTS idx_invite_uses    ON invite_keys(uses_left);
-`);
-  await pool.query(`
-  ALTER TABLE activity_log
-    ADD COLUMN IF NOT EXISTS event_type TEXT,
-    ADD COLUMN IF NOT EXISTS discord_id TEXT,
-    ADD COLUMN IF NOT EXISTS hwid       TEXT,
-    ADD COLUMN IF NOT EXISTS ip         TEXT,
-    ADD COLUMN IF NOT EXISTS details    TEXT,
-    ADD COLUMN IF NOT EXISTS timestamp  BIGINT;
+    // 1) Удаляем старые таблицы (если есть)
+    await client.query(`
+      DROP TABLE IF EXISTS sessions      CASCADE;
+      DROP TABLE IF EXISTS oauth_states  CASCADE;
+      DROP TABLE IF EXISTS activity_log  CASCADE;
+      DROP TABLE IF EXISTS invite_keys   CASCADE;
+      DROP TABLE IF EXISTS users         CASCADE;
+    `);
 
-  CREATE INDEX IF NOT EXISTS idx_activity_discord ON activity_log(discord_id);
-  CREATE INDEX IF NOT EXISTS idx_activity_time    ON activity_log(timestamp);
-`);
+    // 2) Создаём заново — актуальная схема
+    await client.query(`
+      CREATE TABLE users (
+        discord_id            TEXT PRIMARY KEY,
+        discord_username      TEXT,
+        discord_avatar        TEXT,
+        hwid                  TEXT,
+        subscription_expires  BIGINT NOT NULL,
+        max_hwid_resets       INTEGER DEFAULT 3,
+        hwid_resets_used      INTEGER DEFAULT 0,
+        scripts               JSONB   DEFAULT '["kaelis.gs"]'::jsonb,
+        banned                BOOLEAN DEFAULT FALSE,
+        ban_reason            TEXT,
+        created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login            BIGINT
+      );
 
+      CREATE TABLE sessions (
+        session_id      TEXT PRIMARY KEY,
+        discord_id      TEXT NOT NULL,
+        hwid            TEXT NOT NULL,
+        expires         BIGINT NOT NULL,
+        last_heartbeat  BIGINT,
+        active_scripts  JSONB   DEFAULT '[]'::jsonb,
+        ip              TEXT,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE oauth_states (
+        state       TEXT PRIMARY KEY,
+        hwid        TEXT NOT NULL,
+        created_at  BIGINT NOT NULL,
+        expires     BIGINT NOT NULL
+      );
+
+      CREATE TABLE activity_log (
+        id         BIGSERIAL PRIMARY KEY,
+        event_type TEXT,
+        discord_id TEXT,
+        hwid       TEXT,
+        ip         TEXT,
+        details    TEXT,
+        timestamp  BIGINT
+      );
+
+      -- одноразовые/многоразовые инвайт-ключи
+      CREATE TABLE invite_keys (
+        key_id      TEXT PRIMARY KEY,
+        days        INTEGER NOT NULL,
+        scripts     JSONB   DEFAULT '["kaelis.gs"]'::jsonb,
+        uses_left   INTEGER DEFAULT 1,
+        created_by  TEXT,
+        created_at  BIGINT NOT NULL,
+        expires_at  BIGINT,             -- NULL = не истекает
+        note        TEXT
+      );
+
+      -- индексы
+      CREATE INDEX idx_users_hwid            ON users(hwid);
+      CREATE INDEX idx_sessions_expires      ON sessions(expires);
+      CREATE INDEX idx_activity_timestamp    ON activity_log(timestamp);
+      CREATE INDEX idx_oauth_expires         ON oauth_states(expires);
+      CREATE INDEX idx_activity_discord      ON activity_log(discord_id);
+      CREATE INDEX idx_activity_time         ON activity_log(timestamp);
+    `);
+
+    await client.query('COMMIT');
+    console.log('✅ Database recreated & migrations applied');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ Migration failed:', e);
+    throw e;
+  } finally {
+    client.release();
+  }
 }
+
 
 // ═══════════════════════════════════════════════════════════════
 // DISCORD ALERTS
@@ -1327,6 +1338,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
