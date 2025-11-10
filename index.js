@@ -74,7 +74,40 @@ function hmacMd5(key, msg) {
   const inner = md5(ipad + msg);
   return md5(opad + inner);
 }
-
+function md5hex(s) {
+  return crypto.createHash('md5').update(s, 'utf8').digest('hex');
+}
+function md5buf(buf) {
+  return crypto.createHash('md5').update(buf).digest(); // Buffer(16)
+}
+function hmacMd5Buf(keyBuf, dataBuf) {
+  return crypto.createHmac('md5', keyBuf).update(dataBuf).digest(); // Buffer(16)
+}
+class RC4 {
+  constructor(keyBuf) {
+    this.S = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) this.S[i] = i;
+    let j = 0;
+    for (let i = 0; i < 256; i++) {
+      j = (j + this.S[i] + keyBuf[i % keyBuf.length]) & 255;
+      const t = this.S[i]; this.S[i] = this.S[j]; this.S[j] = t;
+    }
+    this.i = 0; this.j = 0;
+  }
+  _nextByte() {
+    this.i = (this.i + 1) & 255;
+    this.j = (this.j + this.S[this.i]) & 255;
+    const t = this.S[this.i]; this.S[this.i] = this.S[this.j]; this.S[this.j] = t;
+    const K = this.S[(this.S[this.i] + this.S[this.j]) & 255];
+    return K;
+  }
+  drop(n = 1024) { for (let k = 0; k < n; k++) this._nextByte(); }
+  crypt(buf) {
+    const out = Buffer.allocUnsafe(buf.length);
+    for (let n = 0; n < buf.length; n++) out[n] = buf[n] ^ this._nextByte();
+    return out;
+  }
+}
 function signedJson(res, obj) {
   const body = JSON.stringify(obj);
   const sig = hmacMd5(SECRET_KEY, body);
@@ -94,126 +127,52 @@ function constantTimeCompare(a, b) {
 // ═══════════════════════════════════════════════════════════════
 // ADVANCED XOR OBFUSCATION (без Brotli)
 // ═══════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════
-// FIXED ADVANCED XOR OBFUSCATION
-// ═══════════════════════════════════════════════════════════════
-// Добавь это на СЕРВЕРЕ для тестирования одного чанка
-// Вставь в функцию advancedXorObfuscate
-
-function advancedXorObfuscate(buffer, hwid, chunkIndex) {
-  const isTestChunk = chunkIndex === 0; // логируем chunk 0
-  
+function rc4EncryptChunk(buffer, hwid, chunkIndex) {
+  const isTestChunk = chunkIndex === 0;
   if (isTestChunk) {
     console.log('\n========== SERVER ENCRYPT CHUNK 0 ==========');
-    console.log('hwid:', hwid);
-    console.log('chunkIndex:', chunkIndex);
+    console.log('hwid:', hwid, 'chunkIndex:', chunkIndex);
     console.log('buffer length:', buffer.length);
     console.log('buffer MD5:', crypto.createHash('md5').update(buffer).digest('hex'));
+    console.log('keyHex:', keyHex);
   }
-
-  if (DEBUG_PLAIN) {
-    console.log(`[DEBUG] Plain chunk ${chunkIndex}, len=${buffer.length}, md5=${crypto.createHash('md5').update(buffer).digest('hex')}`);
-    return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
-  }
-
-  // Generate keys
-  const key1 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor1' + chunkIndex).digest('hex');
-  const key2 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor2' + chunkIndex).digest('hex');
-  const key3 = crypto.createHash('md5').update(SECRET_KEY + hwid + 'xor3' + chunkIndex).digest('hex');
-  const shuffleKey = crypto.createHash('md5').update(SECRET_KEY + hwid + 'shuffle' + chunkIndex).digest('hex');
-  
   if (isTestChunk) {
-    console.log('\n--- KEYS ---');
-    console.log('key1:', key1);
-    console.log('key2:', key2);
-    console.log('key3:', key3);
-    console.log('shuffle:', shuffleKey);
-  }
-  
-  // Add prefix
-  const prefix = isTestChunk ? Buffer.alloc(16, 0xAA) : crypto.randomBytes(16); // для теста делаем фиксированный
-  let data = Buffer.concat([prefix, buffer]);
-  
-  if (isTestChunk) {
-    console.log('\n--- AFTER PREFIX ---');
-    console.log('Length:', data.length);
-    console.log('First 32 bytes:', data.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
-  }
-  
-  // Layer 1
-  const key1Bytes = Buffer.from(key1, 'hex');
-  for (let i = 0; i < data.length; i++) {
-    const keyIdx = i % key1Bytes.length;
-    const posShift = (i * 7 + chunkIndex) % 256;
-    data[i] ^= key1Bytes[keyIdx] ^ posShift;
-  }
-  
-  if (isTestChunk) {
-    console.log('\n--- AFTER LAYER 1 ---');
-    console.log('First 32 bytes:', data.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
-  }
-  
-  // Layer 2: Shuffling
-  const shuffled = Buffer.alloc(data.length);
-  const shuffleBytes = Buffer.from(shuffleKey, 'hex');
-  
-  for (let i = 0; i < data.length; i++) {
-    const shuffle = shuffleBytes[i % shuffleBytes.length];
-    const newPos = (i + shuffle + chunkIndex) % data.length;
-    shuffled[newPos] = data[i];
-  }
-  
-  if (isTestChunk) {
-    console.log('\n--- AFTER LAYER 2 (SHUFFLE) ---');
-    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
-  }
-  
-  // Layer 3
-  const key2Bytes = Buffer.from(key2, 'hex');
-  for (let i = 0; i < shuffled.length; i++) {
-    const keyIdx = (shuffled.length - i - 1) % key2Bytes.length;
-    shuffled[i] ^= key2Bytes[keyIdx];
-  }
-  
-  if (isTestChunk) {
-    console.log('\n--- AFTER LAYER 3 ---');
-    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
-  }
-  
-  // Layer 4
-  const key3Bytes = Buffer.from(key3, 'hex');
-  const blockSize = 16;
-  for (let i = 0; i < shuffled.length; i += blockSize) {
-    const blockKey = key3Bytes[Math.floor(i / blockSize) % key3Bytes.length];
-    for (let j = 0; j < blockSize && i + j < shuffled.length; j++) {
-      shuffled[i + j] ^= blockKey ^ (j * 3);
-    }
-  }
-  
-  if (isTestChunk) {
-    console.log('\n--- AFTER LAYER 4 ---');
-    console.log('First 32 bytes:', shuffled.slice(0, 32).toString('hex').match(/.{2}/g).join(' '));
-  }
-  
-  // Add postfix
-  const postfix = isTestChunk ? Buffer.alloc(16, 0xBB) : crypto.randomBytes(16);
-  const final = Buffer.concat([shuffled, postfix]);
-  
-  if (isTestChunk) {
-    console.log('\n--- FINAL ---');
-    console.log('Total length:', final.length);
-    const b64 = final.toString('base64');
-    console.log('Base64 length:', b64.length);
-    console.log('Base64 (first 100):', b64.substring(0, 100));
+    console.log('Total length (encrypted+HMAC):', encrypted.length + hmac.length);
+    console.log('First 32 bytes (encrypted):', encrypted.slice(0,32).toString('hex').match(/.{2}/g).join(' '));
+    console.log('HMAC:', hmac.toString('hex'));
+    console.log('Base64 (first100):', Buffer.concat([encrypted,hmac]).toString('base64').substring(0,100));
     console.log('========================================\n');
   }
-  
-  return final.toString('base64');
+  if (DEBUG_PLAIN) {
+    const plain = Buffer.concat([Buffer.from('PLAIN0'), buffer]);
+    return plain.toString('base64');
+  }
+
+  // Ключ RC4: md5(secret:hwid:chunkIndex) -> hex -> bytes
+  const keyHex = md5hex(`${SECRET_KEY}:${hwid}:${chunkIndex}`);
+  const keyBuf = Buffer.from(keyHex, 'hex');
+
+  // Паддинг 16/16
+  const prefix = isTestChunk ? Buffer.alloc(16, 0xAA) : crypto.randomBytes(16);
+  const postfix = isTestChunk ? Buffer.alloc(16, 0xBB) : crypto.randomBytes(16);
+  const padded = Buffer.concat([prefix, buffer, postfix]);
+
+  // RC4 + DROP
+  const rc4 = new RC4(keyBuf);
+  rc4.drop(1024); // важный дроп начальных байт
+  const encrypted = rc4.crypt(padded);
+
+  // HMAC-MD5(encrypted || `${hwid}:${chunkIndex}`) → 16 байт
+  const meta = Buffer.from(`${hwid}:${chunkIndex}`, 'utf8');
+  const hmac = hmacMd5Buf(Buffer.from(SECRET_KEY, 'utf8'), Buffer.concat([encrypted, meta]));
+
+  // Итоговый пакет: [encrypted][hmac16] -> base64
+  return Buffer.concat([encrypted, hmac]).toString('base64');
 }
 
 function encryptChunk(data, hwid, chunkIndex) {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
-  return advancedXorObfuscate(buffer, hwid, chunkIndex);
+  return rc4EncryptChunk(buffer, hwid, chunkIndex);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -568,7 +527,7 @@ app.get('/health', async (req, res) => {
       version: '3.2',
       scripts_loaded: SCRIPT_CHUNKS.size,
       auth_method: 'discord_oauth2',
-      encryption: 'advanced-xor'
+      encryption: 'rc4-hmac-md5-drop1024'
     });
   } catch (e) {
     res.status(500).json({
@@ -964,7 +923,7 @@ app.post('/script/chunk', async (req, res) => {
       chunk_hash: chunkHash,
       plain_md5,                 // >>> ДОБАВЛЕНО
       encoding: 'base64',
-      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'advanced-xor'
+      cipher: process.env.DISABLE_ENC === '1' ? 'plain' : 'rc4-hmac-md5-drop1024'
     });
 
   } catch (e) {
@@ -1417,7 +1376,6 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
-
 
 
 
