@@ -90,19 +90,66 @@ const pool = new Pool({
 pool.on('error', (err) => {
   console.error('âŒ PostgreSQL pool error:', err);
 });
-async function dropSchemaObjects() {
+async function hardResetPublicSchema() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // порядок на случай будущих FK:
-    await client.query('DROP TABLE IF EXISTS activity_log   CASCADE;');
-    await client.query('DROP TABLE IF EXISTS banned_hwids   CASCADE;');
-    await client.query('DROP TABLE IF EXISTS keys           CASCADE;');
+    // Самый простой и чистый способ снести всё
+    await client.query('DROP SCHEMA IF EXISTS public CASCADE;');
+    await client.query('CREATE SCHEMA public;');
+    // (опционально) вернуть дефолтные права
+    await client.query('GRANT ALL ON SCHEMA public TO public;');
     await client.query('COMMIT');
-    console.log('✅ Dropped tables: keys, banned_hwids, activity_log');
+    console.log('✅ Dropped & recreated schema "public"');
   } catch (e) {
     await client.query('ROLLBACK');
-    console.error('❌ Drop failed:', e.message);
+    console.error('❌ hardResetPublicSchema failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Фолбэк, если DROP SCHEMA запрещён (хостинг урезал права)
+async function dropAllObjectsFallback() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Сгенерим DROP для всех объектов в public (таблицы/вьюхи/последовательности/типы)
+    const q = `
+      DO $$
+      DECLARE r RECORD;
+      BEGIN
+        -- drop views first
+        FOR r IN (SELECT 'DROP VIEW IF EXISTS public.' || quote_ident(table_name) || ' CASCADE;' AS q
+                  FROM information_schema.views WHERE table_schema='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop tables
+        FOR r IN (SELECT 'DROP TABLE IF EXISTS public.' || quote_ident(tablename) || ' CASCADE;' AS q
+                  FROM pg_tables WHERE schemaname='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop sequences
+        FOR r IN (SELECT 'DROP SEQUENCE IF EXISTS public.' || quote_ident(sequence_name) || ' CASCADE;' AS q
+                  FROM information_schema.sequences WHERE sequence_schema='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop types
+        FOR r IN (
+          SELECT 'DROP TYPE IF EXISTS public.' || quote_ident(t.typname) || ' CASCADE;' AS q
+          FROM pg_type t
+          JOIN pg_namespace n ON n.oid = t.typnamespace
+          WHERE n.nspname='public' AND t.typcategory NOT IN ('A','P') AND t.typtype IN ('e','c','d') -- enum/composite/domain
+        )
+        LOOP EXECUTE r.q; END LOOP;
+      END$$;`;
+    await client.query(q);
+    await client.query('COMMIT');
+    console.log('✅ Dropped all objects in schema "public" (fallback)');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ dropAllObjectsFallback failed:', e.message);
     throw e;
   } finally {
     client.release();
@@ -114,6 +161,7 @@ async function createNeededTables() {
   try {
     await client.query('BEGIN');
 
+    // === только то, что нужно серверу ===
     await client.query(`
       CREATE TABLE IF NOT EXISTS keys (
         key_name    TEXT PRIMARY KEY,
@@ -132,17 +180,17 @@ async function createNeededTables() {
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS banned_hwids (
-        hwid        TEXT PRIMARY KEY,
-        reason      TEXT,
-        banned_at   BIGINT,
+        hwid          TEXT PRIMARY KEY,
+        reason        TEXT,
+        banned_at     BIGINT,
         banned_by_key TEXT,
-        banned_ip   TEXT
+        banned_ip     TEXT
       );
     `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS activity_log (
-        id        BIGSERIAL PRIMARY KEY,
+        id         BIGSERIAL PRIMARY KEY,
         event_type TEXT,
         ip         TEXT,
         hwid       TEXT,
@@ -152,39 +200,77 @@ async function createNeededTables() {
       );
     `);
 
-    // полезные индексы
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_expires ON keys(expires);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_banned  ON keys(banned);`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_log_ts       ON activity_log(timestamp);`);
+    // Для Discord-бота (ключи/пользователи). Удали, если бот сейчас не нужен:
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        discord_id           TEXT PRIMARY KEY,
+        discord_username     TEXT,
+        subscription_expires BIGINT DEFAULT 0,
+        hwid                 TEXT,
+        banned               BOOLEAN DEFAULT FALSE,
+        ban_reason           TEXT,
+        resets_left          INT DEFAULT 3,
+        scripts              JSONB DEFAULT '[]',
+        last_login           BIGINT,
+        created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS invite_keys (
+        key         TEXT PRIMARY KEY,
+        days        INT NOT NULL,
+        uses_left   INT NOT NULL,
+        expires_at  BIGINT,
+        scripts     JSONB DEFAULT '[]',
+        note        TEXT,
+        revoked     BOOLEAN DEFAULT FALSE,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Индексы
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_expires  ON keys(expires);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_banned   ON keys(banned);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_log_ts        ON activity_log(timestamp);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_exp     ON users(subscription_expires);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_banned  ON users(banned);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_inv_keys_exp  ON invite_keys(expires_at);`);
 
     await client.query('COMMIT');
-    console.log('✅ Created required tables');
+    console.log('✅ Created ONLY required tables');
   } catch (e) {
     await client.query('ROLLBACK');
-    console.error('❌ Create tables failed:', e.message);
+    console.error('❌ createNeededTables failed:', e.message);
     throw e;
   } finally {
     client.release();
   }
 }
 
-// старое имя оставим как thin-wrapper для обратной совместимости
-async function runMigrations() {
-  // «мягкая» миграция без дропа — если нужно оставить данные
+async function initializeSchema() {
+  console.log(`ℹ INIT_MODE=${INIT_MODE}`);
+  if (INIT_MODE === 'reset_all') {
+    try {
+      await hardResetPublicSchema();
+    } catch (e) {
+      console.warn('⚠ hardResetPublicSchema unavailable, trying fallback…');
+      await dropAllObjectsFallback();
+    }
+    await createNeededTables();
+    return;
+  }
+  if (INIT_MODE === 'reset') {
+    // мягкий дроп известных таблиц
+    await dropAllObjectsFallback(); // можно оставить только keys/banned_hwids/activity_log если хочешь мягче
+    await createNeededTables();
+    return;
+  }
+  // migrate (по умолчанию) — просто ensure
   await createNeededTables();
 }
 
-// новый инициализатор с режимом
-async function initializeSchema() {
-  if (INIT_MODE === 'reset') {
-    console.warn('⚠ INIT_MODE=reset — dropping tables…');
-    await dropSchemaObjects();
-    await createNeededTables();
-  } else {
-    console.log('ℹ INIT_MODE=migrate — ensuring tables exist…');
-    await runMigrations();
-  }
-}
 
 
 const tokens = new Map();
@@ -1040,6 +1126,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
