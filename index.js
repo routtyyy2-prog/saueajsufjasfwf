@@ -1,39 +1,45 @@
-// ULTRA SECURE RAILWAY SERVER WITH POSTGRESQL
+// ╔════════════════════════════════════════════════════════════════╗
+// ║  ULTRA SECURE SERVER V2.0 - DISCORD AUTH + CHUNKED LOADING    ║
+// ║  • Discord OAuth через бота                                    ║
+// ║  • AES-256-GCM шифрование                                      ║
+// ║  • Chunked module delivery                                     ║
+// ║  • Heartbeat validation                                        ║
+// ║  • PostgreSQL для пользователей                                ║
+// ╚════════════════════════════════════════════════════════════════╝
+
 require('dotenv').config();
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
-let _fetch = globalThis.fetch;
-if (!_fetch) {
-  _fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-}
-const fetch = (...args) => _fetch(...args);
-
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
 
-// === CONFIG ===
+// ═══════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 8080;
 const SECRET_KEY = process.env.SECRET_KEY || "";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN || "";
 const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || "";
 const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
-const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
-const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
-function md5hex(s) {
+
+// ═══════════════════════════════════════════════════════════════
+// CRYPTO HELPERS
+// ═══════════════════════════════════════════════════════════════
+function md5(s) {
   return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
 
-// Важно: имитируем твою Lua-функцию: md5(ipad..msg) => hex, затем md5(opad..innerHex)
-function hmacMd5LuaCompat(key, msg) {
+function hmacMd5(key, msg) {
   const block = 64;
-  if (key.length > block) key = md5hex(key); // как в твоём Lua
-
+  if (key.length > block) key = md5(key);
+  
   const kb = Buffer.from(key, 'utf8');
   let ipad = '';
   let opad = '';
@@ -42,41 +48,69 @@ function hmacMd5LuaCompat(key, msg) {
     ipad += String.fromCharCode(b ^ 0x36);
     opad += String.fromCharCode(b ^ 0x5c);
   }
-  const inner = md5hex(ipad + msg);     // md5 → HEX-СТРОКА
-  const outer = md5hex(opad + inner);   // md5(opad || HEX(inner))
-  return outer;                         // hex
+  
+  const inner = md5(ipad + msg);
+  return md5(opad + inner);
 }
 
-// Отправить JSON с подписью (подписываем ровно JSON.stringify(obj))
 function signedJson(res, obj) {
   const body = JSON.stringify(obj);
-  const sig  = hmacMd5LuaCompat(SECRET_KEY, body);
+  const sig = hmacMd5(SECRET_KEY, body);
   res.set('X-Resp-Sig', sig);
   res.type('application/json').send(body);
 }
 
-// Отправить text/plain с подписью (для /load)
 function signedText(res, text) {
-  const sig = hmacMd5LuaCompat(SECRET_KEY, text);
+  const sig = hmacMd5(SECRET_KEY, text);
   res.set('X-Resp-Sig', sig);
   res.type('text/plain').send(text);
 }
-const SCRIPT_REGISTRY = {
-  "kaelis.gs": "test12.lua",
-  // добавляйте другие скрипты
-};
 
-if (!SECRET_KEY) {
-  console.error("❌ Missing SECRET_KEY");
-  process.exit(1);
+function constantTimeCompare(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
-if (!DATABASE_URL) {
-  console.error("❌ Missing DATABASE_URL");
-  process.exit(1);
+// ═══════════════════════════════════════════════════════════════
+// AES ENCRYPTION (вместо XOR!)
+// ═══════════════════════════════════════════════════════════════
+function aesEncrypt(text, hwid) {
+  const algorithm = 'aes-256-gcm';
+  
+  // Derive key from SECRET_KEY + HWID
+  const key = crypto.pbkdf2Sync(
+    SECRET_KEY + hwid,
+    'loader_v2_salt',
+    100000,
+    32,
+    'sha256'
+  );
+  
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(algorithm, key, iv);
+  
+  // Add 32-byte padding on both sides (как в твоём Lua)
+  const padding = crypto.randomBytes(32).toString('hex');
+  const paddedText = padding + text + padding;
+  
+  let encrypted = cipher.update(paddedText, 'utf8');
+  encrypted = Buffer.concat([encrypted, cipher.final()]);
+  
+  const authTag = cipher.getAuthTag();
+  
+  // Format: iv + encrypted + authTag
+  const combined = Buffer.concat([iv, encrypted, authTag]);
+  
+  return combined.toString('base64');
 }
 
-// === POSTGRESQL ===
+// ═══════════════════════════════════════════════════════════════
+// POSTGRESQL DATABASE
+// ═══════════════════════════════════════════════════════════════
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
@@ -86,339 +120,210 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('❌ PostgreSQL pool error:', err);
+  console.error('❌ PostgreSQL error:', err);
 });
+
 async function runMigrations() {
   await pool.query(`
-  CREATE TABLE IF NOT EXISTS keys (
-    key_name TEXT PRIMARY KEY,
-    hwid TEXT DEFAULT NULL,
-    expires BIGINT NOT NULL,
-    scripts JSONB DEFAULT '[]',
-    banned BOOLEAN DEFAULT FALSE,
-    ban_reason TEXT,
-    banned_at BIGINT,
-    banned_hwid TEXT,
-    banned_ip TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS banned_hwids (
-    hwid TEXT PRIMARY KEY,
-    reason TEXT,
-    banned_at BIGINT,
-    banned_by_key TEXT,
-    banned_ip TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS activity_log (
-    id BIGSERIAL PRIMARY KEY,
-    event_type TEXT,
-    ip TEXT,
-    hwid TEXT,
-    key_name TEXT,
-    details TEXT,
-    timestamp BIGINT
-  );
+    CREATE TABLE IF NOT EXISTS users (
+      discord_id TEXT PRIMARY KEY,
+      discord_username TEXT,
+      hwid TEXT,
+      subscription_expires BIGINT NOT NULL,
+      scripts JSONB DEFAULT '[]',
+      banned BOOLEAN DEFAULT FALSE,
+      ban_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS sessions (
+      session_id TEXT PRIMARY KEY,
+      discord_id TEXT NOT NULL,
+      hwid TEXT NOT NULL,
+      expires BIGINT NOT NULL,
+      last_heartbeat BIGINT,
+      active_scripts JSONB DEFAULT '[]',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS pending_auths (
+      auth_code TEXT PRIMARY KEY,
+      poll_token TEXT NOT NULL,
+      hwid TEXT NOT NULL,
+      username TEXT,
+      expires BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS activity_log (
+      id BIGSERIAL PRIMARY KEY,
+      event_type TEXT,
+      discord_id TEXT,
+      hwid TEXT,
+      ip TEXT,
+      details TEXT,
+      timestamp BIGINT
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_sessions_discord ON sessions(discord_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
+    CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_auths(expires);
   `);
-  console.log('✅ DB migrations applied');
+  console.log('✅ Database migrations applied');
 }
 
-const tokens = new Map();
-const nonces = new Map();
-const failedAttempts = new Map();
-const rateLimitStore = new Map();
-const suspiciousIPs = new Map();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [t, d] of tokens.entries()) if (now > d.expires) tokens.delete(t);
-  for (const [n, ts] of nonces.entries()) if (now - ts > 30000) nonces.delete(n);
-  for (const [ip, d] of failedAttempts.entries()) if (now - d.lastAttempt > 300000) failedAttempts.delete(ip);
-  for (const [hwid, d] of rateLimitStore.entries()) if (now > d.resetTime) rateLimitStore.delete(hwid);
-  for (const [ip, d] of suspiciousIPs.entries()) if (now - d.lastSeen > 600000) suspiciousIPs.delete(ip);
-}, 5000);
-
-// === DATABASE FUNCTIONS ===
-async function getKeyByName(keyName) {
-  const client = await pool.connect();
-  try {
-    // Case-insensitive поиск
-    const result = await client.query(
-      'SELECT * FROM keys WHERE LOWER(key_name) = LOWER($1) LIMIT 1',
-      [keyName]
-    );
-    return result.rows[0] || null;
-  } finally {
-    client.release();
-  }
-}
-
-async function updateKeyHwid(keyName, hwid) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      'UPDATE keys SET hwid = $1, updated_at = CURRENT_TIMESTAMP WHERE LOWER(key_name) = LOWER($2)',
-      [hwid, keyName]
-    );
-    console.log(`✅ HWID bound: ${keyName} -> ${hwid.slice(0, 12)}`);
-    return true;
-  } catch (e) {
-    console.error('❌ Failed to update HWID:', e.message);
-    return false;
-  } finally {
-    client.release();
-  }
-}
-
-async function banKey(keyName, reason, hwid, ip) {
-  const client = await pool.connect();
-  try {
-    const banTime = Math.floor(Date.now() / 1000);
-    await client.query(
-      `UPDATE keys 
-       SET banned = TRUE, ban_reason = $1, banned_at = $2, banned_hwid = $3, banned_ip = $4, updated_at = CURRENT_TIMESTAMP
-       WHERE LOWER(key_name) = LOWER($5)`,
-      [reason, banTime, hwid, ip, keyName]
-    );
-    console.log(`✅ Key banned: ${keyName} (${reason})`);
-    return true;
-  } catch (e) {
-    console.error('❌ Failed to ban key:', e.message);
-    return false;
-  } finally {
-    client.release();
-  }
-}
-
-async function addBannedHwid(hwid, reason, keyName, ip) {
-  const client = await pool.connect();
-  try {
-    const banTime = Math.floor(Date.now() / 1000);
-    await client.query(
-      `INSERT INTO banned_hwids (hwid, reason, banned_at, banned_by_key, banned_ip)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (hwid) DO NOTHING`,
-      [hwid, reason, banTime, keyName, ip]
-    );
-    console.log(`✅ HWID banned: ${hwid.slice(0, 12)}`);
-    return true;
-  } catch (e) {
-    console.error('❌ Failed to ban HWID:', e.message);
-    return false;
-  } finally {
-    client.release();
-  }
-}
-
-async function isHwidBanned(hwid) {
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      'SELECT 1 FROM banned_hwids WHERE hwid = $1 LIMIT 1',
-      [hwid]
-    );
-    return result.rows.length > 0;
-  } finally {
-    client.release();
-  }
-}
-
-async function logActivity(eventType, ip, hwid, keyName, details) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `INSERT INTO activity_log (event_type, ip, hwid, key_name, details, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [eventType, ip, hwid, keyName, details, Date.now()]
-    );
-  } catch (e) {
-    console.error('❌ Failed to log activity:', e.message);
-  } finally {
-    client.release();
-  }
-}
-
-// === GITLAB (только для загрузки скриптов) ===
-function gitlabHeaders() {
-  return {
-    'PRIVATE-TOKEN': GITLAB_TOKEN,
-    'Content-Type': 'application/json'
-  };
-}
-
-async function fetchGitLabScript(scriptPath) {
-  if (!GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
-    console.warn('⚠️ GitLab not configured for scripts');
-    return null;
-  }
-
-  const encodedPath = scriptPath.replace(/([^a-zA-Z0-9-._~])/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-  const url = `https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encodedPath}/raw?ref=${GITLAB_BRANCH}`;
-
-  try {
-    const res = await fetch(url, { headers: gitlabHeaders() });
-    if (!res.ok) {
-      console.error("❌ Script fetch failed:", res.status);
-      return null;
-    }
-    return await res.text();
-  } catch (e) {
-    console.error("❌ Script fetch error:", e.message);
-    return null;
-  }
-}
-
-// === UTILS ===
-function md5(s) { return crypto.createHash('md5').update(s).digest('hex'); }
-function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
-
-function getClientIP(req) {
-  return (req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown')
-    .split(',')[0].trim();
-}
-
-function constantTimeCompare(a, b) {
-  if (!a || !b || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-function xorEncrypt(txt, key) {
-  const padding = crypto.randomBytes(16).toString('hex');
-  const fullText = padding + txt + padding;
-  
-  const tb = Buffer.from(fullText, 'utf8');
-  const kb = Buffer.from(key, 'utf8');
-  const res = Buffer.alloc(tb.length);
-  
-  for (let i = 0; i < tb.length; i++) {
-    res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
-  }
-  
-  return res.toString('base64');
-}
-
+// ═══════════════════════════════════════════════════════════════
+// DISCORD WEBHOOK ALERTS
+// ═══════════════════════════════════════════════════════════════
 async function sendAlert(message, level = 'warning') {
-  if (!ALERT_WEBHOOK) return;
-  const color = level === 'critical' ? 15158332 : (level === 'warning' ? 16776960 : 3447003);
+  if (!DISCORD_WEBHOOK) return;
+  
+  const colors = {
+    info: 3447003,
+    warning: 16776960,
+    critical: 15158332,
+    success: 3066993
+  };
+  
   try {
-    await fetch(ALERT_WEBHOOK, {
+    await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         embeds: [{
-          title: `🔒 Security Alert [${level.toUpperCase()}]`,
+          title: `🔐 Loader Alert [${level.toUpperCase()}]`,
           description: message,
-          color,
+          color: colors[level] || colors.warning,
           timestamp: new Date().toISOString(),
           footer: { text: 'Loader' }
         }]
       })
     });
-  } catch (e) { console.error("Alert error:", e.message); }
+  } catch (e) {
+    console.error('Alert error:', e.message);
+  }
 }
 
-function detectMITM(req) {
-  const indicators = [];
-  
-  if (req.headers['via']) indicators.push('Via header');
-  if (req.headers['forwarded']) indicators.push('Forwarded header');
-  if (req.headers['proxy-connection']) indicators.push('Proxy-Connection');
-  if (req.headers['x-proxy-id']) indicators.push('X-Proxy-ID');
-  
-  const accept = (req.headers['accept'] || '').toLowerCase();
-  if (accept.includes('fiddler') || accept.includes('charles')) {
-    indicators.push('Proxy tool detected');
+// ═══════════════════════════════════════════════════════════════
+// GITLAB (для загрузки скриптов)
+// ═══════════════════════════════════════════════════════════════
+async function fetchGitLabFile(path) {
+  if (!GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
+    console.warn('⚠️ GitLab not configured');
+    return null;
   }
   
-  const conn = (req.headers['connection'] || '').toLowerCase();
-  if (conn.includes('proxy')) indicators.push('Proxy in Connection');
+  const encodedPath = encodeURIComponent(path);
+  const url = `https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encodedPath}/raw?ref=${GITLAB_BRANCH}`;
   
-  const ua = req.headers['user-agent'] || '';
-  if (!ua || ua.length < 20) indicators.push('Suspicious UA');
-  
-  const proto = req.headers['x-forwarded-proto'] || req.protocol;
-  if (proto !== 'https') indicators.push('Non-HTTPS');
-  
-  return indicators;
+  try {
+    const res = await fetch(url, {
+      headers: { 'PRIVATE-TOKEN': GITLAB_TOKEN }
+    });
+    
+    if (!res.ok) {
+      console.error('❌ GitLab fetch failed:', res.status);
+      return null;
+    }
+    
+    return await res.text();
+  } catch (e) {
+    console.error('❌ GitLab error:', e.message);
+    return null;
+  }
 }
 
-function checkHwidRateLimit(hwid) {
-  const now = Date.now();
-  const limit = rateLimitStore.get(hwid);
-  if (!limit) { rateLimitStore.set(hwid, { count: 1, resetTime: now + 60000 }); return true; }
-  if (now > limit.resetTime) { rateLimitStore.set(hwid, { count: 1, resetTime: now + 60000 }); return true; }
-  if (limit.count >= 3) return false;
-  limit.count++; return true;
-}
-
-function verifyClientFingerprint(req, hwid, nonce) {
-  const got = (req.headers['x-client-fp'] || '').toString();
-  const expected = md5(`${hwid}:${nonce}:${SECRET_CHECKSUM}`);
-  return constantTimeCompare(got, expected);
-}
-
-async function logSuspiciousActivity(ip, hwid, key, reason, autoban = false) {
-  const k = ip;
-  const a = failedAttempts.get(k) || { count: 0, lastAttempt: 0 };
-  a.count++; a.lastAttempt = Date.now(); failedAttempts.set(k, a);
-  
-  console.warn(`⚠️ SUSPICIOUS: ${reason} | IP: ${ip} | HWID: ${hwid?.slice(0,8)} | Key: ${key?.slice(0,8)} | #${a.count}`);
-  
-  await logActivity('suspicious', ip, hwid, key, reason);
-  
-  if (autoban || a.count >= 3) {
-    if (hwid) await addBannedHwid(hwid, reason, key, ip);
-    if (key) {
-      await banKey(key, reason, hwid, ip);
-      await sendAlert(
-        `**🚨 AUTO-BAN TRIGGERED**\n` +
-        `**Reason:** ${reason}\n` +
-        `**Key:** \`${key}\`\n` +
-        `**HWID:** \`${hwid || 'unknown'}\`\n` +
-        `**IP:** \`${ip}\`\n` +
-        `**Attempts:** ${a.count}`,
-        'critical'
-      );
+// ═══════════════════════════════════════════════════════════════
+// SCRIPT REGISTRY (script_id -> GitLab path)
+// ═══════════════════════════════════════════════════════════════
+const SCRIPTS = {
+  "kaelis.gs": {
+    name: "Kaelis Script",
+    modules: {
+      init: "scripts/kaelis/init.lua",
+      ui: "scripts/kaelis/ui.lua",
+      visuals: "scripts/kaelis/visuals.lua",
+      aim: "scripts/kaelis/aim.lua"
     }
   }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════
+function getClientIP(req) {
+  return (req.headers['x-forwarded-for'] || 
+          req.headers['x-real-ip'] || 
+          req.socket.remoteAddress || 
+          'unknown').split(',')[0].trim();
 }
 
-function checkScriptAllowed(keyEntry, scriptName) {
-  if (!keyEntry) return false;
-  if (!keyEntry.scripts || keyEntry.scripts.length === 0) return true;
-  return keyEntry.scripts.includes(scriptName);
+function generateToken(length = 32) {
+  return crypto.randomBytes(length).toString('hex');
 }
 
-// === RATE LIMIT ===
+async function logActivity(eventType, discordId, hwid, ip, details) {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log (event_type, discord_id, hwid, ip, details, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [eventType, discordId, hwid, ip, details, Date.now()]
+    );
+  } catch (e) {
+    console.error('❌ Log error:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RATE LIMITING
+// ═══════════════════════════════════════════════════════════════
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 8,
+  max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
-  message: { error: 'Rate limit' }
+  message: { error: 'Rate limit exceeded' }
 });
+
 app.use(globalLimiter);
 
-// === HEALTH ===
+// ═══════════════════════════════════════════════════════════════
+// CLEANUP OLD DATA (каждые 5 минут)
+// ═══════════════════════════════════════════════════════════════
+setInterval(async () => {
+  const now = Date.now();
+  try {
+    // Delete expired sessions
+    await pool.query('DELETE FROM sessions WHERE expires < $1', [now]);
+    
+    // Delete expired pending auths
+    await pool.query('DELETE FROM pending_auths WHERE expires < $1', [now]);
+    
+    // Delete old activity logs (> 30 days)
+    const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
+    await pool.query('DELETE FROM activity_log WHERE timestamp < $1', [thirtyDaysAgo]);
+  } catch (e) {
+    console.error('❌ Cleanup error:', e.message);
+  }
+}, 5 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════════════
+// HEALTH CHECK
+// ═══════════════════════════════════════════════════════════════
 app.get('/health', async (req, res) => {
   try {
     const client = await pool.connect();
     await client.query('SELECT 1');
     client.release();
     
-    res.json({ 
+    res.json({
       status: 'online',
       database: 'connected',
-      tokens: tokens.size,
-      cert_fp: EXPECTED_CERT_FINGERPRINT.slice(0, 16) + "..."
+      version: '2.0'
     });
   } catch (e) {
-    res.status(500).json({ 
+    res.status(500).json({
       status: 'degraded',
       database: 'error',
       error: e.message
@@ -426,318 +331,461 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// === AUTH (с проверкой ключа из PostgreSQL) ===
-app.post('/auth', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// DISCORD OAUTH FLOW - STEP 1: INIT
+// ═══════════════════════════════════════════════════════════════
+app.post('/discord/init', async (req, res) => {
   const ip = getClientIP(req);
-  const ua = req.headers['user-agent'] || 'unknown';
-  const { hwid, timestamp, nonce, signature, key, script_name, client_cert_fp } = req.body || {};
-
-  // MITM Detection
-  const mitmIndicators = detectMITM(req);
-  if (mitmIndicators.length > 0) {
-    const suspData = suspiciousIPs.get(ip) || { count: 0, lastSeen: 0 };
-    suspData.count++;
-    suspData.lastSeen = Date.now();
-    suspiciousIPs.set(ip, suspData);
-    
-    await sendAlert(
-      `**🔴 MITM DETECTED**\n` +
-      `**IP:** \`${ip}\`\n` +
-      `**Indicators:** ${mitmIndicators.join(', ')}\n` +
-      `**HWID:** \`${hwid?.slice(0,12) || 'unknown'}\`\n` +
-      `**Key:** \`${key?.slice(0,12) || 'unknown'}\``,
-      'critical'
-    );
-    
-    if (suspData.count >= 2) {
-      await logSuspiciousActivity(ip, hwid, key, `MITM: ${mitmIndicators.join(',')}`, true);
-    }
-    
-    return res.status(403).json({ error: 'Proxy detected' });
+  const { hwid, username, timestamp, nonce, signature } = req.body || {};
+  
+  if (!hwid || !timestamp || !nonce || !signature) {
+    return res.status(400).json({ error: 'Missing parameters' });
   }
-
-  // Certificate Pinning
-  if (client_cert_fp && EXPECTED_CERT_FINGERPRINT && !constantTimeCompare(client_cert_fp, EXPECTED_CERT_FINGERPRINT)) {
-    await sendAlert(
-      `**🔴 CERT PINNING FAIL**\n` +
-      `**Expected:** \`${EXPECTED_CERT_FINGERPRINT.slice(0,32)}...\`\n` +
-      `**Got:** \`${client_cert_fp.slice(0,32)}...\`\n` +
-      `**IP:** \`${ip}\``,
-      'critical'
-    );
-    await logSuspiciousActivity(ip, hwid, key, 'Certificate mismatch', true);
-    return res.status(403).json({ error: 'Invalid certificate' });
+  
+  // Verify signature
+  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  if (!constantTimeCompare(signature, expectedSig)) {
+    await logActivity('init_failed', null, hwid, ip, 'Bad signature');
+    return res.status(403).json({ error: 'Invalid signature' });
   }
-
+  
+  // Verify fingerprint
+  const clientFp = req.headers['x-client-fp'];
+  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
+  if (!constantTimeCompare(clientFp, expectedFp)) {
+    await logActivity('init_failed', null, hwid, ip, 'Bad fingerprint');
+    return res.status(403).json({ error: 'Invalid fingerprint' });
+  }
+  
+  // Generate auth code and poll token
+  const authCode = generateToken(4).toUpperCase();  // 8-char code
+  const pollToken = generateToken(32);
+  
   try {
-    if (!hwid || !timestamp || !nonce || !signature || !key || !script_name) {
-      await logSuspiciousActivity(ip, hwid, key, 'Missing params');
-      return res.status(400).json({ error: 'Missing params' });
-    }
-
-    // Ban check
-    if (await isHwidBanned(hwid)) {
-      await sendAlert(`**Banned HWID tried access**\nHWID: \`${hwid}\`\nIP: \`${ip}\``, 'critical');
-      return res.status(403).json({ error: 'Banned' });
-    }
-
-    // Rate limit
-    if (!checkHwidRateLimit(hwid)) {
-      await logSuspiciousActivity(ip, hwid, key, 'Rate limit');
-      return res.status(429).json({ error: 'Too many requests' });
-    }
-
-    // Timestamp
-    const reqTime = parseInt(timestamp);
-    const now = Date.now();
-    if (isNaN(reqTime) || Math.abs(now - reqTime) > 30000) {
-      await logSuspiciousActivity(ip, hwid, key, 'Invalid timestamp');
-      return res.status(403).json({ error: 'Timestamp' });
-    }
-
-    // Replay
-    const nonceKey = `${hwid}:${timestamp}:${nonce}`;
-    if (nonces.has(nonceKey)) {
-      await logSuspiciousActivity(ip, hwid, key, 'Replay attack', true);
-      await sendAlert(`**🔴 REPLAY**\nHWID: \`${hwid}\`\nIP: \`${ip}\`\nKey: \`${key}\``, 'critical');
-      return res.status(403).json({ error: 'Replay' });
-    }
-    nonces.set(nonceKey, now);
-
-    // Fingerprint
-    if (!verifyClientFingerprint(req, hwid, nonce)) {
-      await logSuspiciousActivity(ip, hwid, key, 'Bad fingerprint', true);
-      await sendAlert(`**🔴 FINGERPRINT FAIL**\nHWID: \`${hwid}\`\nIP: \`${ip}\``, 'critical');
-      return res.status(403).json({ error: 'Bad FP' });
-    }
-
-    // Signature
-    const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
-    if (!constantTimeCompare(signature, expectedSig)) {
-      await logSuspiciousActivity(ip, hwid, key, 'Bad signature');
-      return res.status(403).json({ error: 'Bad sig' });
-    }
-
-    // === KEY VALIDATION (POSTGRESQL) ===
-    const keyEntry = await getKeyByName(key);
+    // Store pending auth
+    await pool.query(
+      `INSERT INTO pending_auths (auth_code, poll_token, hwid, username, expires)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (auth_code) DO NOTHING`,
+      [authCode, pollToken, hwid, username, Date.now() + 120000]  // 2 min expiry
+    );
     
-    if (!keyEntry) {
-      await logSuspiciousActivity(ip, hwid, key, 'Invalid key');
-      return res.status(403).json({ error: 'Invalid key' });
-    }
-
-    if (keyEntry.banned) {
-      await sendAlert(`**Banned key access**\nKey: \`${keyEntry.key_name}\`\nReason: \`${keyEntry.ban_reason}\`\nHWID: \`${hwid}\`\nIP: \`${ip}\``, 'critical');
-      return res.status(403).json({ error: 'Banned key' });
-    }
-
-    const keyExpiry = parseInt(keyEntry.expires) || 0;
-    if (keyExpiry === 0 || Math.floor(now / 1000) >= keyExpiry) {
-      await logSuspiciousActivity(ip, hwid, key, 'Key expired');
-      return res.status(403).json({ error: 'Expired' });
-    }
-
-    const keyHwid = String(keyEntry.hwid || "*");
-    
-    // ИСПРАВЛЕНИЕ: Привязка HWID к ключу
-    if (keyHwid === "*" || keyHwid === "" || keyHwid === null) {
-      // Ключ не привязан - привязываем HWID
-      await updateKeyHwid(keyEntry.key_name, hwid);
-      console.log(`🔗 HWID auto-bound: ${keyEntry.key_name} -> ${hwid.slice(0, 12)}`);
-    } else if (keyHwid !== hwid) {
-      // HWID не совпадает
-      await logSuspiciousActivity(ip, hwid, key, 'HWID mismatch', true);
-      await sendAlert(`**🔴 HWID MISMATCH**\nKey: \`${keyEntry.key_name}\`\nExpected: \`${keyHwid}\`\nGot: \`${hwid}\`\nIP: \`${ip}\``, 'critical');
-      return res.status(403).json({ error: 'HWID mismatch' });
-    }
-
-    // Если это запрос валидации (без загрузки скрипта)
-    if (script_name === "__validate__") {
-      console.log(`✅ Key validated: ${keyEntry.key_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
-      await logActivity('validate', ip, hwid, keyEntry.key_name, 'success');
-      return signedJson(res, {
-        success: true,
-        expires: keyExpiry,
-        key: keyEntry.key_name
-      });
-    }
-
-    // Script permission check
-    if (!checkScriptAllowed(keyEntry, script_name)) {
-      await logSuspiciousActivity(ip, hwid, key, 'Script not allowed');
-      return res.status(403).json({ error: 'Script not allowed' });
-    }
-
-    // === УСПЕХ - ГЕНЕРИРУЕМ ТОКЕН ===
-    const token = crypto.randomBytes(32).toString('hex');
-    const tokenHash = sha256(token);
-    
-    const tokenData = { 
-      hwid, 
-      ip, 
-      ua, 
-      key: keyEntry.key_name,
-      script_name,
-      expires: now + 5000,  // токен живет 5 секунд
-      used: false, 
-      created: now 
-    };
-    
-    tokens.set(tokenHash, tokenData);
-
-    // Шифруй токен перед отправкой (защита от Fiddler)
-    const encryptedToken = xorEncrypt(token, hwid);
-
-    console.log(`✅ Token: ${token.slice(0,8)}... | Key: ${keyEntry.key_name} | Script: ${script_name} | HWID: ${hwid.slice(0,8)} | IP: ${ip}`);
-    await logActivity('auth_success', ip, hwid, keyEntry.key_name, script_name);
+    await logActivity('discord_init', null, hwid, ip, 'Auth code generated');
     
     signedJson(res, {
-      token: encryptedToken,
-      expires_in: 5,
-      server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
+      auth_code: authCode,
+      poll_token: pollToken,
+      expires_in: 120
     });
-
   } catch (e) {
-    console.error("❌ AUTH ERROR:", e);
-    await logSuspiciousActivity(ip, hwid, key, 'Server error');
+    console.error('❌ Init error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
-
-// === LOAD (с загрузкой из GitLab) ===
-app.post('/load', async (req, res) => {
-  const ip = getClientIP(req);
-  const { token } = req.body || {};
+// ═══════════════════════════════════════════════════════════════
+// DISCORD OAUTH FLOW - STEP 2: POLL
+// ═══════════════════════════════════════════════════════════════
+app.post('/discord/poll', async (req, res) => {
+  const { poll_token } = req.body || {};
   
-  if (!token) {
-    await logSuspiciousActivity(ip, null, null, 'No token');
-    return res.status(400).json({ error: 'No token' });
+  if (!poll_token) {
+    return res.status(400).json({ error: 'Missing poll_token' });
   }
-
-  const tokenHash = sha256(token);
-  const tdata = tokens.get(tokenHash);
   
-  if (!tdata) {
-    await logSuspiciousActivity(ip, null, null, 'Invalid token');
-    return res.status(403).json({ error: 'Bad token' });
-  }
-
-  if (Date.now() > tdata.expires) {
-    tokens.delete(tokenHash);
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token expired');
-    return res.status(403).json({ error: 'Expired' });
-  }
-
-  if (tdata.used) {
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token reuse', true);
-    await sendAlert(`**🔴 TOKEN REUSE**\nKey: \`${tdata.key}\`\nHWID: \`${tdata.hwid}\`\nIP: \`${ip}\``, 'critical');
-    return res.status(403).json({ error: 'Token used' });
-  }
-
-  if (tdata.ip !== ip) {
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'IP change', true);
-    await sendAlert(`**🔴 TOKEN STOLEN**\nKey: \`${tdata.key}\`\nExpected: \`${tdata.ip}\`\nGot: \`${ip}\``, 'critical');
-    return res.status(403).json({ error: 'IP mismatch' });
-  }
-
-  tdata.used = true;
-
   try {
-    // Найти файл скрипта
-    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
-    if (!scriptPath) {
-      console.error("❌ Unknown script:", tdata.script_name);
-      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Unknown script');
+    // Check if auth completed
+    const result = await pool.query(
+      `SELECT pa.hwid, pa.username, pa.auth_code, u.discord_id, u.discord_username, u.subscription_expires
+       FROM pending_auths pa
+       LEFT JOIN users u ON u.hwid = pa.hwid
+       WHERE pa.poll_token = $1 AND pa.expires > $2`,
+      [poll_token, Date.now()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired poll token' });
+    }
+    
+    const pending = result.rows[0];
+    
+    // Check if user linked discord yet
+    if (!pending.discord_id) {
+      // Still waiting for Discord link
+      return res.status(202).json({ status: 'pending' });
+    }
+    
+    // User linked! Create session
+    const sessionId = generateToken(32);
+    const sessionExp = Date.now() + (24 * 60 * 60 * 1000);  // 24 hours
+    
+    await pool.query(
+      `INSERT INTO sessions (session_id, discord_id, hwid, expires, last_heartbeat)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, pending.discord_id, pending.hwid, sessionExp, Date.now()]
+    );
+    
+    // Delete pending auth
+    await pool.query('DELETE FROM pending_auths WHERE poll_token = $1', [poll_token]);
+    
+    await logActivity('discord_login', pending.discord_id, pending.hwid, getClientIP(req), 'Success');
+    
+    signedJson(res, {
+      discord_id: pending.discord_id,
+      session_id: sessionId,
+      expires: sessionExp
+    });
+  } catch (e) {
+    console.error('❌ Poll error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CHUNKED SCRIPT DELIVERY (главная фишка защиты!)
+// ═══════════════════════════════════════════════════════════════
+
+// При старте сервера: разбить скрипты на чанки
+const SCRIPT_CHUNKS = new Map();
+
+async function prepareScriptChunks() {
+  for (const [scriptId, script] of Object.entries(SCRIPTS)) {
+    console.log(`📦 Preparing chunks for ${scriptId}...`);
+    
+    // Загрузить скрипт из GitLab
+    const scriptCode = await fetchGitLabFile(script.modules.init);
+    if (!scriptCode) {
+      console.error(`❌ Failed to load ${scriptId}`);
+      continue;
+    }
+    
+    // Разбить на чанки по ~500 символов
+    const CHUNK_SIZE = 500;
+    const chunks = [];
+    
+    for (let i = 0; i < scriptCode.length; i += CHUNK_SIZE) {
+      chunks.push(scriptCode.substring(i, i + CHUNK_SIZE));
+    }
+    
+    console.log(`✅ ${scriptId}: ${chunks.length} chunks`);
+    
+    SCRIPT_CHUNKS.set(scriptId, {
+      chunks: chunks,
+      total: chunks.length,
+      hash: crypto.createHash('md5').update(scriptCode).digest('hex')
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ENDPOINT: /script/meta (получить метаданные)
+// ═══════════════════════════════════════════════════════════════
+app.post('/script/meta', async (req, res) => {
+  const ip = getClientIP(req);
+  const { hwid, session_id, script_id, timestamp, nonce, signature } = req.body || {};
+  
+  if (!hwid || !session_id || !script_id || !timestamp || !nonce || !signature) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+  
+  // Verify signature
+  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  if (!constantTimeCompare(signature, expectedSig)) {
+    return res.status(403).json({ error: 'Invalid signature' });
+  }
+  
+  // Verify fingerprint
+  const clientFp = req.headers['x-client-fp'];
+  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
+  if (!constantTimeCompare(clientFp, expectedFp)) {
+    return res.status(403).json({ error: 'Invalid fingerprint' });
+  }
+  
+  try {
+    // Validate session
+    const sessResult = await pool.query(
+      `SELECT s.discord_id, u.subscription_expires, u.banned, u.scripts
+       FROM sessions s
+       JOIN users u ON u.discord_id = s.discord_id
+       WHERE s.session_id = $1 AND s.hwid = $2 AND s.expires > $3`,
+      [session_id, hwid, Date.now()]
+    );
+    
+    if (sessResult.rows.length === 0) {
+      return res.status(403).json({ error: 'Invalid session' });
+    }
+    
+    const session = sessResult.rows[0];
+    
+    if (session.banned) {
+      return res.status(403).json({ error: 'Account banned' });
+    }
+    
+    if (session.subscription_expires < Date.now()) {
+      return res.status(403).json({ error: 'Subscription expired' });
+    }
+    
+    // Check script access
+    const allowedScripts = session.scripts || [];
+    if (allowedScripts.length > 0 && !allowedScripts.includes(script_id)) {
+      return res.status(403).json({ error: 'Script not allowed' });
+    }
+    
+    // Get chunks info
+    const scriptData = SCRIPT_CHUNKS.get(script_id);
+    if (!scriptData) {
       return res.status(404).json({ error: 'Script not found' });
     }
-
-    // Загрузить из GitLab
-    const scriptCode = await fetchGitLabScript(scriptPath);
-    if (!scriptCode) {
-      console.error("❌ Script fetch failed");
-      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Script fetch failed');
-      return res.status(502).json({ error: 'Upstream error' });
+    
+    // Generate RANDOM chunk order (защита от Fiddler!)
+    const chunkOrder = [];
+    for (let i = 1; i <= scriptData.total; i++) {
+      chunkOrder.push(i);
     }
-
-    // Шифруй скрипт
-    const encryptedScript = xorEncrypt(scriptCode, tdata.hwid);
     
-    // Удали токен (одноразовый)
-    tokens.delete(tokenHash);
-
-    console.log(`✅ Script delivered: ${tdata.script_name} | Key=${tdata.key} | HWID=${tdata.hwid.slice(0,8)} | IP=${ip} | Size=${encryptedScript.length}b`);
-    await logActivity('load_success', ip, tdata.hwid, tdata.key, tdata.script_name);
+    // Fisher-Yates shuffle
+    for (let i = chunkOrder.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [chunkOrder[i], chunkOrder[j]] = [chunkOrder[j], chunkOrder[i]];
+    }
     
-    signedText(res, encryptedScript);
-
-
+    await logActivity('script_meta', session.discord_id, hwid, ip, script_id);
+    
+    signedJson(res, {
+      total_chunks: scriptData.total,
+      chunk_order: chunkOrder.join(','),
+      script_hash: scriptData.hash
+    });
   } catch (e) {
-    console.error("❌ LOAD ERROR:", e);
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Load error: ' + e.message);
+    console.error('❌ Script meta error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
-
-// === TAMPER REPORT ===
-app.post('/report_tamper', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// ENDPOINT: /script/chunk (получить один чанк)
+// ═══════════════════════════════════════════════════════════════
+app.post('/script/chunk', async (req, res) => {
   const ip = getClientIP(req);
-  const { hwid, key, reason, details } = req.body || {};
+  const { hwid, session_id, script_id, chunk_id, timestamp, nonce, signature } = req.body || {};
+  
+  if (!hwid || !session_id || !script_id || !chunk_id || !timestamp || !nonce || !signature) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+  
+  // Verify signature
+  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  if (!constantTimeCompare(signature, expectedSig)) {
+    return res.status(403).json({ error: 'Invalid signature' });
+  }
+  
+  // Verify fingerprint
+  const clientFp = req.headers['x-client-fp'];
+  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
+  if (!constantTimeCompare(clientFp, expectedFp)) {
+    return res.status(403).json({ error: 'Invalid fingerprint' });
+  }
+  
+  try {
+    // Validate session
+    const sessResult = await pool.query(
+      'SELECT discord_id FROM sessions WHERE session_id = $1 AND hwid = $2 AND expires > $3',
+      [session_id, hwid, Date.now()]
+    );
+    
+    if (sessResult.rows.length === 0) {
+      return res.status(403).json({ error: 'Invalid session' });
+    }
+    
+    const discordId = sessResult.rows[0].discord_id;
+    
+    // Get chunk
+    const scriptData = SCRIPT_CHUNKS.get(script_id);
+    if (!scriptData) {
+      return res.status(404).json({ error: 'Script not found' });
+    }
+    
+    const chunkIdNum = parseInt(chunk_id);
+    if (isNaN(chunkIdNum) || chunkIdNum < 1 || chunkIdNum > scriptData.total) {
+      return res.status(400).json({ error: 'Invalid chunk_id' });
+    }
+    
+    const chunkData = scriptData.chunks[chunkIdNum - 1];
+    if (!chunkData) {
+      return res.status(404).json({ error: 'Chunk not found' });
+    }
+    
+    // Encrypt chunk with AES
+    const encrypted = aesEncrypt(chunkData, hwid);
+    
+    // Логируем только каждый 10-й чанк (чтоб не спамить логи)
+    if (chunkIdNum % 10 === 0) {
+      await logActivity('chunk_load', discordId, hwid, ip, `${script_id}:${chunk_id}`);
+    }
+    
+    signedJson(res, {
+      chunk: encrypted,
+      chunk_id: chunkIdNum
+    });
+  } catch (e) {
+    console.error('❌ Chunk error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
 
+// Удалить старый /module/load endpoint (больше не нужен)
+
+// ═══════════════════════════════════════════════════════════════
+// HEARTBEAT (проверка каждые 3 сек)
+// ═══════════════════════════════════════════════════════════════
+app.post('/heartbeat', async (req, res) => {
+  const { session_id, runtime_hash, active_scripts } = req.body || {};
+  
+  if (!session_id) {
+    return res.status(400).json({ error: 'Missing session_id' });
+  }
+  
+  try {
+    // Update session
+    const result = await pool.query(
+      `UPDATE sessions 
+       SET last_heartbeat = $1, active_scripts = $2
+       WHERE session_id = $3 AND expires > $4
+       RETURNING discord_id, hwid`,
+      [Date.now(), active_scripts ? JSON.parse(`["${active_scripts}"]`) : [], session_id, Date.now()]
+    );
+    
+    if (result.rows.length === 0) {
+      return signedJson(res, { action: 'terminate', reason: 'Session expired' });
+    }
+    
+    const session = result.rows[0];
+    
+    // Check if user banned
+    const userResult = await pool.query(
+      'SELECT banned FROM users WHERE discord_id = $1',
+      [session.discord_id]
+    );
+    
+    if (userResult.rows.length > 0 && userResult.rows[0].banned) {
+      return signedJson(res, { action: 'terminate', reason: 'Account banned' });
+    }
+    
+    signedJson(res, { status: 'ok' });
+  } catch (e) {
+    console.error('❌ Heartbeat error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TAMPER REPORT
+// ═══════════════════════════════════════════════════════════════
+app.post('/report/tamper', async (req, res) => {
+  const ip = getClientIP(req);
+  const { hwid, session_id, reason } = req.body || {};
+  
   if (!hwid || !reason) {
     return res.status(400).json({ error: 'Missing data' });
   }
-
-  console.warn(`🚨 TAMPER: ${reason} | HWID: ${hwid?.slice(0,8)} | Key: ${key?.slice(0,8)} | IP: ${ip}`);
-
-  await addBannedHwid(hwid, `Hook: ${reason}`, key, ip);
-
-  if (key) {
-    await banKey(key, `Hook: ${reason}`, hwid, ip);
+  
+  try {
+    let discordId = null;
+    
+    if (session_id) {
+      const result = await pool.query(
+        'SELECT discord_id FROM sessions WHERE session_id = $1',
+        [session_id]
+      );
+      if (result.rows.length > 0) {
+        discordId = result.rows[0].discord_id;
+      }
+    }
+    
+    // Ban user
+    if (discordId) {
+      await pool.query(
+        `UPDATE users 
+         SET banned = TRUE, ban_reason = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE discord_id = $2`,
+        [reason, discordId]
+      );
+    }
+    
+    await logActivity('tamper_detected', discordId, hwid, ip, reason);
+    
+    await sendAlert(
+      `**🚨 TAMPER DETECTED**\n` +
+      `**Discord:** ${discordId || 'unknown'}\n` +
+      `**HWID:** ${hwid}\n` +
+      `**IP:** ${ip}\n` +
+      `**Reason:** ${reason}\n` +
+      `**Action:** Account banned`,
+      'critical'
+    );
+    
+    res.json({ status: 'reported' });
+  } catch (e) {
+    console.error('❌ Tamper report error:', e);
+    res.status(500).json({ error: 'Internal error' });
   }
-
-  await sendAlert(
-    `**🚨 HOOK/TAMPER DETECTED**\n` +
-    `**Type:** ${reason}\n` +
-    `**Details:** \`${details || 'none'}\`\n` +
-    `**HWID:** \`${hwid}\`\n` +
-    `**Key:** \`${key || 'unknown'}\`\n` +
-    `**IP:** \`${ip}\`\n` +
-    `**Action:** ✅ Key banned, HWID blocked`,
-    'critical'
-  );
-
-  res.json({ status: 'banned', message: 'Your key has been permanently banned' });
 });
 
-// === BLOCK INVALID ===
-app.get('/auth', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /auth'); res.status(405).json({error:'POST only'}); });
-app.get('/load', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /load'); res.status(405).json({error:'POST only'}); });
-app.use((req,res)=>res.status(404).json({error:'Not found'}));
+// ═══════════════════════════════════════════════════════════════
+// SESSION END
+// ═══════════════════════════════════════════════════════════════
+app.post('/session/end', async (req, res) => {
+  const { session_id } = req.body || {};
+  
+  if (session_id) {
+    try {
+      await pool.query('DELETE FROM sessions WHERE session_id = $1', [session_id]);
+    } catch (e) {
+      console.error('❌ Session end error:', e);
+    }
+  }
+  
+  res.json({ status: 'ok' });
+});
 
-// === START ===
+// ═══════════════════════════════════════════════════════════════
+// BLOCK INVALID ROUTES
+// ═══════════════════════════════════════════════════════════════
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// START SERVER
+// ═══════════════════════════════════════════════════════════════
 app.listen(PORT, async () => {
   await runMigrations();
-  console.log(`\n🔒 ============================================`);
-  console.log(`   ULTRA SECURE LOADER v5.0 (PostgreSQL)`);
-  console.log(`   ============================================`);
+  
+  console.log(`\n🔐 ═══════════════════════════════════════════`);
+  console.log(`   ULTRA SECURE LOADER V2.0 (Discord Auth)`);
+  console.log(`   ═══════════════════════════════════════════`);
   console.log(`   ✅ Port: ${PORT}`);
   console.log(`   ✅ Database: PostgreSQL`);
-  console.log(`   ✅ Auto-ban: ENABLED`);
-  console.log(`   ✅ MITM detection: ENABLED`);
-  console.log(`   ✅ HWID binding: AUTO`);
-  console.log(`   ✅ Scripts: ${Object.keys(SCRIPT_REGISTRY).length}`);
-  console.log(`============================================\n`);
+  console.log(`   ✅ Discord Auth: ENABLED`);
+  console.log(`   ✅ AES-256-GCM: ENABLED`);
+  console.log(`   ✅ Chunked Loading: ENABLED (Random Order!)`);
+  console.log(`   ✅ Heartbeat: 3s intervals`);
+  console.log(`   ✅ Scripts: ${Object.keys(SCRIPTS).length}`);
+  console.log(`═══════════════════════════════════════════\n`);
   
-  // Test database connection
+  // Test database
   try {
     const client = await pool.connect();
     await client.query('SELECT 1');
     client.release();
-    console.log('✅ Database connection: OK\n');
+    console.log('✅ Database connection: OK');
   } catch (e) {
     console.error('❌ Database connection failed:', e.message);
     process.exit(1);
   }
+  
+  // Prepare script chunks
+  console.log('\n📦 Preparing script chunks...');
+  await prepareScriptChunks();
+  console.log('✅ All scripts chunked and ready!\n');
 });
