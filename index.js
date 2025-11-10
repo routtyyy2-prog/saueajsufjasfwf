@@ -312,19 +312,48 @@ app.post('/auth/discord/init', async (req, res) => {
   const ip = getClientIP(req);
   const { hwid, timestamp, nonce, signature } = req.body || {};
   
+  // ======== DEBUG LOGGING ========
+  console.log('\n🔍 ============ AUTH INIT DEBUG ============');
+  console.log('📥 Received parameters:');
+  console.log('   HWID:', hwid);
+  console.log('   Timestamp:', timestamp);
+  console.log('   Nonce:', nonce);
+  console.log('   Received signature:', signature);
+  console.log('   IP:', ip);
+  // ================================
+  
   if (!hwid || !timestamp || !nonce || !signature) {
+    console.log('❌ Missing parameters!');
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
-  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  // ======== DEBUG SIGNATURE CALCULATION ========
+  const sigInput = SECRET_KEY + hwid + timestamp + nonce;
+  console.log('\n🔐 Signature calculation:');
+  console.log('   SECRET_KEY:', SECRET_KEY.substring(0, 8) + '...' + SECRET_KEY.substring(SECRET_KEY.length - 4));
+  console.log('   Input string length:', sigInput.length);
+  console.log('   Input string (first 100):', sigInput.substring(0, 100));
+  
+  const expectedSig = md5(sigInput);
+  console.log('   Expected signature:', expectedSig);
+  console.log('   Received signature:', signature);
+  console.log('   Signatures match:', expectedSig === signature);
+  // =============================================
+  
   if (!constantTimeCompare(signature, expectedSig)) {
     await logActivity('oauth_init_failed', null, hwid, ip, 'Bad signature');
+    console.log('❌ SIGNATURE MISMATCH! Authentication failed.');
+    console.log('==========================================\n');
     return res.status(403).json({ error: 'Invalid signature' });
   }
+  
+  console.log('✅ Signature verified successfully!');
   
   try {
     const state = crypto.randomBytes(32).toString('hex');
     const statePayload = md5(state + hwid + SECRET_KEY);
+    
+    console.log('📝 Creating OAuth state:', statePayload.substring(0, 16) + '...');
     
     await pool.query(
       `INSERT INTO oauth_states (state, hwid, created_at, expires) VALUES ($1, $2, $3, $4)`,
@@ -341,13 +370,19 @@ app.post('/auth/discord/init', async (req, res) => {
     
     const authUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
     
+    console.log('🔗 Generated auth URL');
+    console.log('✅ Sending successful response');
+    console.log('==========================================\n');
+    
     await logActivity('oauth_init', null, hwid, ip, 'OAuth initiated');
     signedJson(res, { auth_url: authUrl, state: statePayload, expires_in: 300 });
   } catch (e) {
     console.error('❌ OAuth init error:', e);
+    console.log('==========================================\n');
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
 
 app.get('/auth/discord/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -625,3 +660,4 @@ app.post('/heartbeat', async (req, res) => {
     process.exit(1);
   }
 })();
+
