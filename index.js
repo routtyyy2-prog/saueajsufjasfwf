@@ -123,21 +123,23 @@ pool.on('error', (err) => {
 async function runMigrations() {
   const client = await pool.connect();
   try {
-    console.log('🧨 Recreating database schema...');
+    const reset = process.env.RESET_DB === '1';
+    console.log(reset ? '🧨 FULL RESET (dropping all tables)...' : '🧩 Running safe migrations...');
+
     await client.query('BEGIN');
 
-    // 1) Удаляем старые таблицы (если есть)
-    await client.query(`
-      DROP TABLE IF EXISTS sessions      CASCADE;
-      DROP TABLE IF EXISTS oauth_states  CASCADE;
-      DROP TABLE IF EXISTS activity_log  CASCADE;
-      DROP TABLE IF EXISTS invite_keys   CASCADE;
-      DROP TABLE IF EXISTS users         CASCADE;
-    `);
+    if (reset) {
+      await client.query(`
+        DROP TABLE IF EXISTS sessions      CASCADE;
+        DROP TABLE IF EXISTS oauth_states  CASCADE;
+        DROP TABLE IF EXISTS activity_log  CASCADE;
+        DROP TABLE IF EXISTS invite_keys   CASCADE;
+        DROP TABLE IF EXISTS users         CASCADE;
+      `);
+    }
 
-    // 2) Создаём заново — актуальная схема
     await client.query(`
-      CREATE TABLE users (
+      CREATE TABLE IF NOT EXISTS users (
         discord_id            TEXT PRIMARY KEY,
         discord_username      TEXT,
         discord_avatar        TEXT,
@@ -153,7 +155,7 @@ async function runMigrations() {
         last_login            BIGINT
       );
 
-      CREATE TABLE sessions (
+      CREATE TABLE IF NOT EXISTS sessions (
         session_id      TEXT PRIMARY KEY,
         discord_id      TEXT NOT NULL,
         hwid            TEXT NOT NULL,
@@ -164,14 +166,14 @@ async function runMigrations() {
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE oauth_states (
+      CREATE TABLE IF NOT EXISTS oauth_states (
         state       TEXT PRIMARY KEY,
         hwid        TEXT NOT NULL,
         created_at  BIGINT NOT NULL,
         expires     BIGINT NOT NULL
       );
 
-      CREATE TABLE activity_log (
+      CREATE TABLE IF NOT EXISTS activity_log (
         id         BIGSERIAL PRIMARY KEY,
         event_type TEXT,
         discord_id TEXT,
@@ -181,29 +183,29 @@ async function runMigrations() {
         timestamp  BIGINT
       );
 
-      -- одноразовые/многоразовые инвайт-ключи
-      CREATE TABLE invite_keys (
+      CREATE TABLE IF NOT EXISTS invite_keys (
         key_id      TEXT PRIMARY KEY,
         days        INTEGER NOT NULL,
         scripts     JSONB   DEFAULT '["kaelis.gs"]'::jsonb,
         uses_left   INTEGER DEFAULT 1,
         created_by  TEXT,
         created_at  BIGINT NOT NULL,
-        expires_at  BIGINT,             -- NULL = не истекает
+        expires_at  BIGINT,
         note        TEXT
       );
 
-      -- индексы
-      CREATE INDEX idx_users_hwid            ON users(hwid);
-      CREATE INDEX idx_sessions_expires      ON sessions(expires);
-      CREATE INDEX idx_activity_timestamp    ON activity_log(timestamp);
-      CREATE INDEX idx_oauth_expires         ON oauth_states(expires);
-      CREATE INDEX idx_activity_discord      ON activity_log(discord_id);
-      CREATE INDEX idx_activity_time         ON activity_log(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_users_hwid            ON users(hwid);
+      CREATE INDEX IF NOT EXISTS idx_sessions_expires      ON sessions(expires);
+      CREATE INDEX IF NOT EXISTS idx_activity_timestamp    ON activity_log(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_oauth_expires         ON oauth_states(expires);
+      CREATE INDEX IF NOT EXISTS idx_activity_discord      ON activity_log(discord_id);
+      CREATE INDEX IF NOT EXISTS idx_activity_time         ON activity_log(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_invite_expires        ON invite_keys(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_invite_uses           ON invite_keys(uses_left);
     `);
 
     await client.query('COMMIT');
-    console.log('✅ Database recreated & migrations applied');
+    console.log(reset ? '✅ Database fully recreated' : '✅ Safe migrations applied');
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('❌ Migration failed:', e);
@@ -212,6 +214,7 @@ async function runMigrations() {
     client.release();
   }
 }
+
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -1338,6 +1341,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
