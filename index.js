@@ -173,23 +173,34 @@ async function runMigrations() {
   `);
   console.log('✅ Database migrations applied');
   await pool.query(`
-  -- activity_log: добавляем недостающие колонки безопасно
+  -- одноразовые/многоразовые инвайт-ключи
+  CREATE TABLE IF NOT EXISTS invite_keys (
+    key_id TEXT PRIMARY KEY,
+    days INTEGER NOT NULL,
+    scripts JSONB DEFAULT '["kaelis.gs"]',
+    uses_left INTEGER DEFAULT 1,
+    created_by TEXT,
+    created_at BIGINT NOT NULL,
+    expires_at BIGINT, -- NULL = не истекает
+    note TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_invite_expires ON invite_keys(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_invite_uses    ON invite_keys(uses_left);
+`);
+  await pool.query(`
   ALTER TABLE activity_log
+    ADD COLUMN IF NOT EXISTS event_type TEXT,
     ADD COLUMN IF NOT EXISTS discord_id TEXT,
     ADD COLUMN IF NOT EXISTS hwid       TEXT,
     ADD COLUMN IF NOT EXISTS ip         TEXT,
     ADD COLUMN IF NOT EXISTS details    TEXT,
-    ADD COLUMN IF NOT EXISTS event_type TEXT,
     ADD COLUMN IF NOT EXISTS timestamp  BIGINT;
 
-  -- на всякий случай индексы (idempotent)
   CREATE INDEX IF NOT EXISTS idx_activity_discord ON activity_log(discord_id);
   CREATE INDEX IF NOT EXISTS idx_activity_time    ON activity_log(timestamp);
-
-  -- полезные индексы для users/sessions (быстрее проверки)
-  CREATE INDEX IF NOT EXISTS idx_users_discord    ON users(discord_id);
-  CREATE INDEX IF NOT EXISTS idx_sessions_discord ON sessions(discord_id);
 `);
+
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -911,48 +922,130 @@ app.post('/session/end', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // BOT API - Create User
 // ═══════════════════════════════════════════════════════════════
-app.post('/bot/create-user', async (req, res) => {
-  const { admin_token, discord_id, discord_username, days, scripts } = req.body || {};
-  
+app.post('/bot/create-key', async (req, res) => {
+  const { admin_token, days, scripts, uses, expires_in_days, note } = req.body || {};
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  
-  if (!discord_id || !days) {
-    return res.status(400).json({ error: 'Missing parameters' });
+  if (!days || days <= 0) {
+    return res.status(400).json({ error: 'days required' });
   }
-  
   try {
-    const expires = Date.now() + (days * 24 * 60 * 60 * 1000);
-    const allowedScripts = scripts || ['kaelis.gs'];
-    
+    const keyId = crypto.randomBytes(16).toString('hex'); // сам ключ
+    const usesLeft = Math.max(1, parseInt(uses || 1, 10));
+    const expiresAt = expires_in_days ? (Date.now() + expires_in_days * 24 * 60 * 60 * 1000) : null;
+    const scriptsList = Array.isArray(scripts) && scripts.length ? scripts : ['kaelis.gs'];
+
     await pool.query(
-      `INSERT INTO users (discord_id, discord_username, subscription_expires, scripts)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (discord_id) DO UPDATE
-       SET subscription_expires = EXCLUDED.subscription_expires,
-           scripts = EXCLUDED.scripts,
-           banned = FALSE,
-           ban_reason = NULL,
-           updated_at = CURRENT_TIMESTAMP`,
-      [discord_id, discord_username || 'Unknown', expires, JSON.stringify(allowedScripts)]
+      `INSERT INTO invite_keys (key_id, days, scripts, uses_left, created_by, created_at, expires_at, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [keyId, days, JSON.stringify(scriptsList), usesLeft, 'bot', Date.now(), expiresAt, note || null]
     );
-    
-    await sendAlert(
-      `**New User Created**\n` +
-      `**Discord:** ${discord_username} (${discord_id})\n` +
-      `**Duration:** ${days} days\n` +
-      `**Scripts:** ${allowedScripts.join(', ')}`,
-      'success'
-    );
-    
-    res.json({ 
+
+    res.json({
       success: true,
-      discord_id: discord_id,
-      expires: expires
+      key: keyId,
+      days,
+      uses_left: usesLeft,
+      expires_at: expiresAt,
+      scripts: scriptsList
     });
   } catch (e) {
-    console.error('❌ Create user error:', e);
+    console.error('❌ create-key error:', e.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.post('/bot/revoke-key', async (req, res) => {
+  const { admin_token, key } = req.body || {};
+  if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!key) return res.status(400).json({ error: 'key required' });
+
+  try {
+    const r = await pool.query('UPDATE invite_keys SET uses_left = 0 WHERE key_id = $1', [key]);
+    res.json({ success: true, updated: r.rowCount });
+  } catch (e) {
+    console.error('❌ revoke-key error:', e.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+app.post('/bot/redeem-key', async (req, res) => {
+  const { admin_token, discord_id, discord_username, key } = req.body || {};
+  if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!discord_id || !key) {
+    return res.status(400).json({ error: 'discord_id and key required' });
+  }
+
+  try {
+    // Находим ключ
+    const now = Date.now();
+    const k = await pool.query(
+      `SELECT * FROM invite_keys WHERE key_id = $1`, [key]
+    );
+    if (k.rows.length === 0) {
+      return res.status(404).json({ error: 'Key not found' });
+    }
+    const keyRow = k.rows[0];
+    if (keyRow.uses_left <= 0) {
+      return res.status(400).json({ error: 'Key exhausted' });
+    }
+    if (keyRow.expires_at && keyRow.expires_at < now) {
+      return res.status(400).json({ error: 'Key expired' });
+    }
+
+    const days = keyRow.days;
+    const scripts = keyRow.scripts || ['kaelis.gs'];
+
+    // Пользователь есть?
+    const u = await pool.query('SELECT * FROM users WHERE discord_id = $1', [discord_id]);
+
+    let newExpires;
+    if (u.rows.length > 0) {
+      const user = u.rows[0];
+      const base = Math.max(user.subscription_expires || 0, now);
+      newExpires = base + days * 24 * 60 * 60 * 1000;
+
+      // обновляем
+      await pool.query(
+        `UPDATE users
+         SET subscription_expires = $1,
+             scripts = $2,
+             banned = FALSE,
+             ban_reason = NULL,
+             discord_username = COALESCE($3, discord_username),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE discord_id = $4`,
+        [newExpires, JSON.stringify(scripts), discord_username || null, discord_id]
+      );
+    } else {
+      newExpires = now + days * 24 * 60 * 60 * 1000;
+      await pool.query(
+        `INSERT INTO users (discord_id, discord_username, subscription_expires, scripts, created_at, updated_at, banned)
+         VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,FALSE)`,
+        [discord_id, discord_username || 'Unknown', newExpires, JSON.stringify(scripts)]
+      );
+    }
+
+    // уменьшаем использований
+    await pool.query(
+      `UPDATE invite_keys
+       SET uses_left = uses_left - 1
+       WHERE key_id = $1`,
+      [key]
+    );
+
+    res.json({
+      success: true,
+      new_expires: newExpires,
+      days_added: days,
+      scripts
+    });
+  } catch (e) {
+    console.error('❌ redeem-key error:', e.message);
     res.status(500).json({ error: 'Internal error' });
   }
 });
@@ -1187,4 +1280,5 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
