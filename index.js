@@ -1,10 +1,9 @@
 // ╔════════════════════════════════════════════════════════════════╗
-// ║  ULTRA SECURE LOADER V2.0 - KEY AUTH + CHUNKED LOADING        ║
-// ║  • Unique key authentication (1 key = 1 HWID)                  ║
-// ║  • Single file chunked delivery (random order)                 ║
-// ║  • Discord bot for key management                              ║
-// ║  • AES-256-GCM encryption                                      ║
-// ║  • Anti-debugging protection                                   ║
+// ║  ULTRA SECURE LOADER V3.0 - DISCORD AUTH + CHUNKED LOADING    ║
+// ║  • Discord OAuth2 authentication                               ║
+// ║  • Chunked script delivery (random order, AES encrypted)       ║
+// ║  • HWID binding per Discord account                            ║
+// ║  • Anti-debugging & anti-tampering                             ║
 // ╚════════════════════════════════════════════════════════════════╝
 
 require('dotenv').config();
@@ -14,20 +13,28 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const fs = require('fs').promises;
 const path = require('path');
+const fetch = require('node-fetch');
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
+app.use(express.static('public')); // для OAuth callback страницы
 
 // ═══════════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 8080;
-const SECRET_KEY = process.env.SECRET_KEY || "";
+const SECRET_KEY = process.env.SECRET_KEY || "k8Jf2mP9xLq4nR7vW3sT6yH5bN8aZ1cD";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 const SCRIPTS_DIR = process.env.SCRIPTS_DIR || './scripts';
+
+// Discord OAuth2
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || "http://localhost:8080/auth/discord/callback";
+const OAUTH_STATE_SECRET = process.env.OAUTH_STATE_SECRET || crypto.randomBytes(32).toString('hex');
 
 // ═══════════════════════════════════════════════════════════════
 // CRYPTO HELPERS
@@ -70,14 +77,14 @@ function constantTimeCompare(a, b) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// AES ENCRYPTION
+// AES-256-GCM ENCRYPTION (для chunks)
 // ═══════════════════════════════════════════════════════════════
 function aesEncrypt(text, hwid) {
   const algorithm = 'aes-256-gcm';
   
   const key = crypto.pbkdf2Sync(
     SECRET_KEY + hwid,
-    'loader_v2_salt',
+    'loader_v3_salt',
     100000,
     32,
     'sha256'
@@ -86,7 +93,7 @@ function aesEncrypt(text, hwid) {
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv(algorithm, key, iv);
   
-  // Add padding
+  // Добавляем padding для обфускации размера
   const padding = crypto.randomBytes(32).toString('hex');
   const paddedText = padding + text + padding;
   
@@ -116,14 +123,14 @@ pool.on('error', (err) => {
 
 async function runMigrations() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS keys (
-      key_id TEXT PRIMARY KEY,
-      hwid TEXT,
-      discord_id TEXT,
+    CREATE TABLE IF NOT EXISTS users (
+      discord_id TEXT PRIMARY KEY,
       discord_username TEXT,
+      discord_avatar TEXT,
+      hwid TEXT,
       subscription_expires BIGINT NOT NULL,
-      max_resets INTEGER DEFAULT 3,
-      resets_used INTEGER DEFAULT 0,
+      max_hwid_resets INTEGER DEFAULT 3,
+      hwid_resets_used INTEGER DEFAULT 0,
       scripts JSONB DEFAULT '["kaelis.gs"]',
       banned BOOLEAN DEFAULT FALSE,
       ban_reason TEXT,
@@ -134,7 +141,7 @@ async function runMigrations() {
     
     CREATE TABLE IF NOT EXISTS sessions (
       session_id TEXT PRIMARY KEY,
-      key_id TEXT NOT NULL,
+      discord_id TEXT NOT NULL,
       hwid TEXT NOT NULL,
       expires BIGINT NOT NULL,
       last_heartbeat BIGINT,
@@ -143,19 +150,27 @@ async function runMigrations() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      state TEXT PRIMARY KEY,
+      hwid TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      expires BIGINT NOT NULL
+    );
+    
     CREATE TABLE IF NOT EXISTS activity_log (
       id BIGSERIAL PRIMARY KEY,
       event_type TEXT,
-      key_id TEXT,
+      discord_id TEXT,
       hwid TEXT,
       ip TEXT,
       details TEXT,
       timestamp BIGINT
     );
     
-    CREATE INDEX IF NOT EXISTS idx_keys_hwid ON keys(hwid);
+    CREATE INDEX IF NOT EXISTS idx_users_hwid ON users(hwid);
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
     CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_oauth_expires ON oauth_states(expires);
   `);
   console.log('✅ Database migrations applied');
 }
@@ -183,7 +198,7 @@ async function sendAlert(message, level = 'warning') {
           description: message,
           color: colors[level] || colors.warning,
           timestamp: new Date().toISOString(),
-          footer: { text: 'Loader' }
+          footer: { text: 'Secure Loader V3' }
         }]
       })
     });
@@ -206,21 +221,12 @@ function generateToken(length = 32) {
   return crypto.randomBytes(length).toString('hex');
 }
 
-function generateKey() {
-  // Format: XXXX-XXXX-XXXX-XXXX
-  const parts = [];
-  for (let i = 0; i < 4; i++) {
-    parts.push(crypto.randomBytes(2).toString('hex').toUpperCase());
-  }
-  return parts.join('-');
-}
-
-async function logActivity(eventType, keyId, hwid, ip, details) {
+async function logActivity(eventType, discordId, hwid, ip, details) {
   try {
     await pool.query(
-      `INSERT INTO activity_log (event_type, key_id, hwid, ip, details, timestamp)
+      `INSERT INTO activity_log (event_type, discord_id, hwid, ip, details, timestamp)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [eventType, keyId, hwid, ip, details, Date.now()]
+      [eventType, discordId, hwid, ip, details, Date.now()]
     );
   } catch (e) {
     console.error('❌ Log error:', e.message);
@@ -236,7 +242,7 @@ async function loadAndChunkScript(scriptId, filePath) {
   try {
     const scriptCode = await fs.readFile(filePath, 'utf8');
     
-    // Chunk size: 500 chars
+    // Chunk size: 500 characters
     const CHUNK_SIZE = 500;
     const chunks = [];
     
@@ -267,7 +273,7 @@ async function prepareAllScripts() {
   // Load kaelis.gs (test12.lua)
   await loadAndChunkScript('kaelis.gs', path.join(SCRIPTS_DIR, 'test12.lua'));
   
-  // Add more scripts here if needed
+  // Add more scripts here
   // await loadAndChunkScript('other.gs', path.join(SCRIPTS_DIR, 'other.lua'));
 }
 
@@ -276,17 +282,17 @@ async function prepareAllScripts() {
 // ═══════════════════════════════════════════════════════════════
 const authLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 5,
+  max: 10,
   message: { error: 'Too many auth attempts' }
 });
 
 const chunkLimiter = rateLimit({
   windowMs: 1000,
-  max: 20,
+  max: 30,
   message: { error: 'Slow down chunk requests' }
 });
 
-app.use('/auth/login', authLimiter);
+app.use('/auth/discord', authLimiter);
 app.use('/script/chunk', chunkLimiter);
 
 // ═══════════════════════════════════════════════════════════════
@@ -296,6 +302,7 @@ setInterval(async () => {
   const now = Date.now();
   try {
     await pool.query('DELETE FROM sessions WHERE expires < $1', [now]);
+    await pool.query('DELETE FROM oauth_states WHERE expires < $1', [now]);
     
     const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
     await pool.query('DELETE FROM activity_log WHERE timestamp < $1', [thirtyDaysAgo]);
@@ -316,8 +323,9 @@ app.get('/health', async (req, res) => {
     res.json({
       status: 'online',
       database: 'connected',
-      version: '2.0',
-      scripts_loaded: SCRIPT_CHUNKS.size
+      version: '3.0',
+      scripts_loaded: SCRIPT_CHUNKS.size,
+      auth_method: 'discord_oauth2'
     });
   } catch (e) {
     res.status(500).json({
@@ -329,79 +337,165 @@ app.get('/health', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// KEY AUTH - LOGIN
+// DISCORD OAUTH2 - STEP 1: Initiate Login
 // ═══════════════════════════════════════════════════════════════
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/discord/init', async (req, res) => {
   const ip = getClientIP(req);
-  const { key, hwid, username, timestamp, nonce, signature } = req.body || {};
+  const { hwid, timestamp, nonce, signature } = req.body || {};
   
-  if (!key || !hwid || !timestamp || !nonce || !signature) {
+  if (!hwid || !timestamp || !nonce || !signature) {
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
   // Verify signature
   const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
   if (!constantTimeCompare(signature, expectedSig)) {
-    await logActivity('login_failed', key, hwid, ip, 'Bad signature');
+    await logActivity('oauth_init_failed', null, hwid, ip, 'Bad signature');
     return res.status(403).json({ error: 'Invalid signature' });
   }
   
-  // Verify fingerprint
-  const clientFp = req.headers['x-client-fp'];
-  const expectedFp = md5(hwid + ':' + nonce + ':' + SECRET_CHECKSUM);
-  if (!constantTimeCompare(clientFp, expectedFp)) {
-    await logActivity('login_failed', key, hwid, ip, 'Bad fingerprint');
-    return res.status(403).json({ error: 'Invalid fingerprint' });
+  try {
+    // Generate OAuth state
+    const state = crypto.randomBytes(32).toString('hex');
+    const statePayload = md5(state + hwid + OAUTH_STATE_SECRET);
+    
+    // Store state
+    await pool.query(
+      `INSERT INTO oauth_states (state, hwid, created_at, expires)
+       VALUES ($1, $2, $3, $4)`,
+      [statePayload, hwid, Date.now(), Date.now() + 5 * 60 * 1000] // 5 min expiry
+    );
+    
+    // Generate Discord OAuth URL
+    const params = new URLSearchParams({
+      client_id: DISCORD_CLIENT_ID,
+      redirect_uri: DISCORD_REDIRECT_URI,
+      response_type: 'code',
+      scope: 'identify',
+      state: statePayload
+    });
+    
+    const authUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
+    
+    await logActivity('oauth_init', null, hwid, ip, 'OAuth initiated');
+    
+    signedJson(res, {
+      auth_url: authUrl,
+      state: statePayload,
+      expires_in: 300
+    });
+  } catch (e) {
+    console.error('❌ OAuth init error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// DISCORD OAUTH2 - STEP 2: Handle Callback
+// ═══════════════════════════════════════════════════════════════
+app.get('/auth/discord/callback', async (req, res) => {
+  const { code, state } = req.query;
+  
+  if (!code || !state) {
+    return res.send('<h1>❌ Invalid callback</h1>');
   }
   
   try {
-    // Check key
-    const result = await pool.query(
-      'SELECT * FROM keys WHERE key_id = $1',
-      [key]
+    // Verify state
+    const stateResult = await pool.query(
+      'SELECT hwid FROM oauth_states WHERE state = $1 AND expires > $2',
+      [state, Date.now()]
     );
     
-    if (result.rows.length === 0) {
-      await logActivity('login_failed', key, hwid, ip, 'Invalid key');
-      return res.status(403).json({ error: 'Invalid key' });
+    if (stateResult.rows.length === 0) {
+      return res.send('<h1>❌ Invalid or expired state</h1>');
     }
     
-    const keyData = result.rows[0];
+    const hwid = stateResult.rows[0].hwid;
+    
+    // Exchange code for token
+    const tokenResponse = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: DISCORD_REDIRECT_URI
+      })
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    if (!tokenData.access_token) {
+      return res.send('<h1>❌ Failed to get access token</h1>');
+    }
+    
+    // Get user info
+    const userResponse = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    
+    const userData = await userResponse.json();
+    
+    if (!userData.id) {
+      return res.send('<h1>❌ Failed to get user info</h1>');
+    }
+    
+    // Check if user exists and has subscription
+    const userResult = await pool.query(
+      'SELECT * FROM users WHERE discord_id = $1',
+      [userData.id]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.send(`
+        <h1>❌ No subscription found</h1>
+        <p>Discord: ${userData.username}</p>
+        <p>Please contact an administrator to get access.</p>
+      `);
+    }
+    
+    const user = userResult.rows[0];
     
     // Check banned
-    if (keyData.banned) {
-      await logActivity('login_failed', key, hwid, ip, 'Banned');
-      return res.status(403).json({ error: 'Key banned: ' + (keyData.ban_reason || 'Unknown') });
+    if (user.banned) {
+      return res.send(`
+        <h1>❌ Account banned</h1>
+        <p>Reason: ${user.ban_reason || 'Unknown'}</p>
+      `);
     }
     
     // Check subscription
-    if (keyData.subscription_expires < Date.now()) {
-      await logActivity('login_failed', key, hwid, ip, 'Expired');
-      return res.status(403).json({ error: 'Subscription expired' });
+    if (user.subscription_expires < Date.now()) {
+      return res.send(`
+        <h1>❌ Subscription expired</h1>
+        <p>Please renew your subscription.</p>
+      `);
     }
     
     // Check HWID
-    if (keyData.hwid && keyData.hwid !== hwid) {
-      await logActivity('login_failed', key, hwid, ip, 'HWID mismatch');
-      return res.status(403).json({ 
-        error: 'Key already bound to another PC',
-        can_reset: keyData.resets_used < keyData.max_resets
-      });
+    if (user.hwid && user.hwid !== hwid) {
+      return res.send(`
+        <h1>❌ HWID Mismatch</h1>
+        <p>This account is already bound to another PC.</p>
+        <p>Resets left: ${user.max_hwid_resets - user.hwid_resets_used}</p>
+        <p>Contact support for HWID reset.</p>
+      `);
     }
     
     // Bind HWID if first time
-    if (!keyData.hwid) {
+    if (!user.hwid) {
       await pool.query(
-        'UPDATE keys SET hwid = $1, updated_at = CURRENT_TIMESTAMP WHERE key_id = $2',
-        [hwid, key]
+        'UPDATE users SET hwid = $1, updated_at = CURRENT_TIMESTAMP WHERE discord_id = $2',
+        [hwid, userData.id]
       );
       
       await sendAlert(
         `**New HWID Bind**\n` +
-        `**Key:** ${key}\n` +
-        `**HWID:** ${hwid}\n` +
-        `**User:** ${username}\n` +
-        `**IP:** ${ip}`,
+        `**User:** ${userData.username} (${userData.id})\n` +
+        `**HWID:** ${hwid}`,
         'info'
       );
     }
@@ -411,87 +505,104 @@ app.post('/auth/login', async (req, res) => {
     const sessionExp = Date.now() + (24 * 60 * 60 * 1000); // 24h
     
     await pool.query(
-      `INSERT INTO sessions (session_id, key_id, hwid, expires, last_heartbeat, ip)
+      `INSERT INTO sessions (session_id, discord_id, hwid, expires, last_heartbeat, ip)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [sessionId, key, hwid, sessionExp, Date.now(), ip]
+      [sessionId, userData.id, hwid, sessionExp, Date.now(), getClientIP(req)]
     );
     
     // Update last login
     await pool.query(
-      'UPDATE keys SET last_login = $1 WHERE key_id = $2',
-      [Date.now(), key]
+      'UPDATE users SET last_login = $1, discord_username = $2, discord_avatar = $3 WHERE discord_id = $4',
+      [Date.now(), userData.username, userData.avatar, userData.id]
     );
     
-    await logActivity('login_success', key, hwid, ip, username);
+    // Delete used state
+    await pool.query('DELETE FROM oauth_states WHERE state = $1', [state]);
     
-    signedJson(res, {
-      session_id: sessionId,
-      expires: sessionExp,
-      subscription_expires: keyData.subscription_expires,
-      scripts: keyData.scripts || ['kaelis.gs'],
-      user_info: {
-        discord: keyData.discord_username || 'Unknown',
-        resets_left: keyData.max_resets - keyData.resets_used
-      }
-    });
+    await logActivity('login_success', userData.id, hwid, getClientIP(req), userData.username);
+    
+    // Return success page with session data (loader will poll /auth/discord/poll)
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Login Success</title>
+        <style>
+          body { font-family: Arial; text-align: center; padding: 50px; background: #2c2f33; color: #fff; }
+          h1 { color: #43b581; }
+          .info { background: #23272a; padding: 20px; border-radius: 10px; margin: 20px auto; max-width: 500px; }
+        </style>
+      </head>
+      <body>
+        <h1>✅ Login Successful!</h1>
+        <div class="info">
+          <p><strong>Discord:</strong> ${userData.username}</p>
+          <p><strong>Session:</strong> ${sessionId.substring(0, 16)}...</p>
+          <p><strong>Expires:</strong> 24 hours</p>
+        </div>
+        <p>You can close this window now.</p>
+        <script>
+          // Store session for polling
+          localStorage.setItem('loader_session', JSON.stringify({
+            session_id: '${sessionId}',
+            expires: ${sessionExp},
+            discord_username: '${userData.username}',
+            hwid: '${hwid}'
+          }));
+        </script>
+      </body>
+      </html>
+    `);
   } catch (e) {
-    console.error('❌ Login error:', e);
-    res.status(500).json({ error: 'Internal error' });
+    console.error('❌ OAuth callback error:', e);
+    res.send('<h1>❌ Internal error</h1>');
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// HWID RESET (через Discord бота)
+// DISCORD OAUTH2 - STEP 3: Poll for Session
 // ═══════════════════════════════════════════════════════════════
-app.post('/auth/reset-hwid', async (req, res) => {
-  const { key, admin_token } = req.body || {};
+app.post('/auth/discord/poll', async (req, res) => {
+  const { hwid, timestamp, nonce, signature } = req.body || {};
   
-  // Only bot can call this
-  if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
-    return res.status(403).json({ error: 'Unauthorized' });
+  if (!hwid || !timestamp || !nonce || !signature) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+  
+  const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+  if (!constantTimeCompare(signature, expectedSig)) {
+    return res.status(403).json({ error: 'Invalid signature' });
   }
   
   try {
+    // Check if session exists for this HWID
     const result = await pool.query(
-      'SELECT * FROM keys WHERE key_id = $1',
-      [key]
+      `SELECT s.session_id, s.expires, u.discord_username, u.subscription_expires, u.scripts
+       FROM sessions s
+       JOIN users u ON u.discord_id = s.discord_id
+       WHERE s.hwid = $1 AND s.expires > $2
+       ORDER BY s.created_at DESC
+       LIMIT 1`,
+      [hwid, Date.now()]
     );
     
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Key not found' });
+      return res.status(404).json({ error: 'No session found' });
     }
     
-    const keyData = result.rows[0];
+    const session = result.rows[0];
     
-    if (keyData.resets_used >= keyData.max_resets) {
-      return res.status(403).json({ error: 'No resets left' });
-    }
-    
-    // Reset HWID
-    await pool.query(
-      `UPDATE keys 
-       SET hwid = NULL, resets_used = resets_used + 1, updated_at = CURRENT_TIMESTAMP
-       WHERE key_id = $1`,
-      [key]
-    );
-    
-    // Kill all sessions
-    await pool.query('DELETE FROM sessions WHERE key_id = $1', [key]);
-    
-    await sendAlert(
-      `**HWID Reset**\n` +
-      `**Key:** ${key}\n` +
-      `**User:** ${keyData.discord_username}\n` +
-      `**Resets left:** ${keyData.max_resets - keyData.resets_used - 1}`,
-      'warning'
-    );
-    
-    res.json({ 
-      success: true,
-      resets_left: keyData.max_resets - keyData.resets_used - 1
+    signedJson(res, {
+      session_id: session.session_id,
+      expires: session.expires,
+      subscription_expires: session.subscription_expires,
+      scripts: session.scripts || ['kaelis.gs'],
+      user_info: {
+        discord: session.discord_username
+      }
     });
   } catch (e) {
-    console.error('❌ Reset error:', e);
+    console.error('❌ Poll error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
@@ -507,7 +618,6 @@ app.post('/script/meta', async (req, res) => {
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
-  // Verify signature
   const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
   if (!constantTimeCompare(signature, expectedSig)) {
     return res.status(403).json({ error: 'Invalid signature' });
@@ -522,9 +632,9 @@ app.post('/script/meta', async (req, res) => {
   try {
     // Validate session
     const sessResult = await pool.query(
-      `SELECT s.key_id, k.scripts, k.banned
+      `SELECT s.discord_id, u.scripts, u.banned
        FROM sessions s
-       JOIN keys k ON k.key_id = s.key_id
+       JOIN users u ON u.discord_id = s.discord_id
        WHERE s.session_id = $1 AND s.hwid = $2 AND s.expires > $3`,
       [session_id, hwid, Date.now()]
     );
@@ -563,7 +673,7 @@ app.post('/script/meta', async (req, res) => {
       [chunkOrder[i], chunkOrder[j]] = [chunkOrder[j], chunkOrder[i]];
     }
     
-    await logActivity('script_meta', session.key_id, hwid, ip, script_id);
+    await logActivity('script_meta', session.discord_id, hwid, ip, script_id);
     
     signedJson(res, {
       total_chunks: scriptData.total,
@@ -601,7 +711,7 @@ app.post('/script/chunk', async (req, res) => {
   try {
     // Validate session
     const sessResult = await pool.query(
-      'SELECT key_id FROM sessions WHERE session_id = $1 AND hwid = $2 AND expires > $3',
+      'SELECT discord_id FROM sessions WHERE session_id = $1 AND hwid = $2 AND expires > $3',
       [session_id, hwid, Date.now()]
     );
     
@@ -609,7 +719,7 @@ app.post('/script/chunk', async (req, res) => {
       return res.status(403).json({ error: 'Invalid session' });
     }
     
-    const keyId = sessResult.rows[0].key_id;
+    const discordId = sessResult.rows[0].discord_id;
     
     // Get chunk
     const scriptData = SCRIPT_CHUNKS.get(script_id);
@@ -632,7 +742,7 @@ app.post('/script/chunk', async (req, res) => {
     
     // Log every 10th chunk
     if (chunkIdNum % 10 === 0) {
-      await logActivity('chunk_load', keyId, hwid, ip, `${script_id}:${chunk_id}`);
+      await logActivity('chunk_load', discordId, hwid, ip, `${script_id}:${chunk_id}`);
     }
     
     signedJson(res, {
@@ -660,7 +770,7 @@ app.post('/heartbeat', async (req, res) => {
       `UPDATE sessions 
        SET last_heartbeat = $1, active_scripts = $2
        WHERE session_id = $3 AND expires > $4
-       RETURNING key_id`,
+       RETURNING discord_id`,
       [Date.now(), active_scripts ? JSON.parse(`["${active_scripts}"]`) : [], session_id, Date.now()]
     );
     
@@ -668,15 +778,15 @@ app.post('/heartbeat', async (req, res) => {
       return signedJson(res, { action: 'terminate', reason: 'Session expired' });
     }
     
-    const keyId = result.rows[0].key_id;
+    const discordId = result.rows[0].discord_id;
     
     // Check if banned
-    const keyResult = await pool.query(
-      'SELECT banned FROM keys WHERE key_id = $1',
-      [keyId]
+    const userResult = await pool.query(
+      'SELECT banned FROM users WHERE discord_id = $1',
+      [discordId]
     );
     
-    if (keyResult.rows.length > 0 && keyResult.rows[0].banned) {
+    if (userResult.rows.length > 0 && userResult.rows[0].banned) {
       return signedJson(res, { action: 'terminate', reason: 'Account banned' });
     }
     
@@ -699,40 +809,40 @@ app.post('/report/tamper', async (req, res) => {
   }
   
   try {
-    let keyId = null;
+    let discordId = null;
     
     if (session_id) {
       const result = await pool.query(
-        'SELECT key_id FROM sessions WHERE session_id = $1',
+        'SELECT discord_id FROM sessions WHERE session_id = $1',
         [session_id]
       );
       if (result.rows.length > 0) {
-        keyId = result.rows[0].key_id;
+        discordId = result.rows[0].discord_id;
       }
     }
     
-    // Ban key
-    if (keyId) {
+    // Ban user
+    if (discordId) {
       await pool.query(
-        `UPDATE keys 
+        `UPDATE users 
          SET banned = TRUE, ban_reason = $1, updated_at = CURRENT_TIMESTAMP
-         WHERE key_id = $2`,
-        [reason, keyId]
+         WHERE discord_id = $2`,
+        [reason, discordId]
       );
       
       // Kill sessions
-      await pool.query('DELETE FROM sessions WHERE key_id = $1', [keyId]);
+      await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discordId]);
     }
     
-    await logActivity('tamper_detected', keyId, hwid, ip, reason);
+    await logActivity('tamper_detected', discordId, hwid, ip, reason);
     
     await sendAlert(
       `**🚨 TAMPER DETECTED**\n` +
-      `**Key:** ${keyId || 'unknown'}\n` +
+      `**Discord ID:** ${discordId || 'unknown'}\n` +
       `**HWID:** ${hwid}\n` +
       `**IP:** ${ip}\n` +
       `**Reason:** ${reason}\n` +
-      `**Action:** Key banned`,
+      `**Action:** Account banned`,
       'critical'
     );
     
@@ -761,10 +871,10 @@ app.post('/session/end', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// BOT API - Generate Key
+// BOT API - Create User
 // ═══════════════════════════════════════════════════════════════
-app.post('/bot/generate-key', async (req, res) => {
-  const { admin_token, discord_id, discord_username, days } = req.body || {};
+app.post('/bot/create-user', async (req, res) => {
+  const { admin_token, discord_id, discord_username, days, scripts } = req.body || {};
   
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -775,75 +885,138 @@ app.post('/bot/generate-key', async (req, res) => {
   }
   
   try {
-    const key = generateKey();
     const expires = Date.now() + (days * 24 * 60 * 60 * 1000);
+    const allowedScripts = scripts || ['kaelis.gs'];
     
     await pool.query(
-      `INSERT INTO keys (key_id, discord_id, discord_username, subscription_expires, scripts)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [key, discord_id, discord_username || 'Unknown', expires, JSON.stringify(['kaelis.gs'])]
+      `INSERT INTO users (discord_id, discord_username, subscription_expires, scripts)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (discord_id) DO UPDATE
+       SET subscription_expires = EXCLUDED.subscription_expires,
+           scripts = EXCLUDED.scripts,
+           banned = FALSE,
+           ban_reason = NULL,
+           updated_at = CURRENT_TIMESTAMP`,
+      [discord_id, discord_username || 'Unknown', expires, JSON.stringify(allowedScripts)]
     );
     
     await sendAlert(
-      `**New Key Generated**\n` +
-      `**Key:** \`${key}\`\n` +
-      `**User:** ${discord_username} (${discord_id})\n` +
-      `**Duration:** ${days} days`,
+      `**New User Created**\n` +
+      `**Discord:** ${discord_username} (${discord_id})\n` +
+      `**Duration:** ${days} days\n` +
+      `**Scripts:** ${allowedScripts.join(', ')}`,
       'success'
     );
     
     res.json({ 
       success: true,
-      key: key,
+      discord_id: discord_id,
       expires: expires
     });
   } catch (e) {
-    console.error('❌ Generate key error:', e);
+    console.error('❌ Create user error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// BOT API - Check Key Info
+// BOT API - Check User Info
 // ═══════════════════════════════════════════════════════════════
-app.post('/bot/check-key', async (req, res) => {
-  const { admin_token, key } = req.body || {};
+app.post('/bot/check-user', async (req, res) => {
+  const { admin_token, discord_id } = req.body || {};
   
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   
-  if (!key) {
-    return res.status(400).json({ error: 'Missing key' });
+  if (!discord_id) {
+    return res.status(400).json({ error: 'Missing discord_id' });
   }
   
   try {
     const result = await pool.query(
-      'SELECT * FROM keys WHERE key_id = $1',
-      [key]
+      'SELECT * FROM users WHERE discord_id = $1',
+      [discord_id]
     );
     
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Key not found' });
+      return res.status(404).json({ error: 'User not found' });
     }
     
-    const keyData = result.rows[0];
+    const user = result.rows[0];
     
     res.json({
-      key: keyData.key_id,
-      discord_id: keyData.discord_id,
-      discord_username: keyData.discord_username,
-      hwid: keyData.hwid || 'Not bound',
-      subscription_expires: keyData.subscription_expires,
-      expires_in_days: Math.floor((keyData.subscription_expires - Date.now()) / (24 * 60 * 60 * 1000)),
-      resets_left: keyData.max_resets - keyData.resets_used,
-      banned: keyData.banned,
-      ban_reason: keyData.ban_reason,
-      last_login: keyData.last_login,
-      scripts: keyData.scripts
+      discord_id: user.discord_id,
+      discord_username: user.discord_username,
+      hwid: user.hwid || 'Not bound',
+      subscription_expires: user.subscription_expires,
+      expires_in_days: Math.floor((user.subscription_expires - Date.now()) / (24 * 60 * 60 * 1000)),
+      resets_left: user.max_hwid_resets - user.hwid_resets_used,
+      banned: user.banned,
+      ban_reason: user.ban_reason,
+      last_login: user.last_login,
+      scripts: user.scripts
     });
   } catch (e) {
-    console.error('❌ Check key error:', e);
+    console.error('❌ Check user error:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// BOT API - Reset HWID
+// ═══════════════════════════════════════════════════════════════
+app.post('/bot/reset-hwid', async (req, res) => {
+  const { admin_token, discord_id } = req.body || {};
+  
+  if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
+  if (!discord_id) {
+    return res.status(400).json({ error: 'Missing discord_id' });
+  }
+  
+  try {
+    const result = await pool.query(
+      'SELECT * FROM users WHERE discord_id = $1',
+      [discord_id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    if (user.hwid_resets_used >= user.max_hwid_resets) {
+      return res.status(403).json({ error: 'No resets left' });
+    }
+    
+    // Reset HWID
+    await pool.query(
+      `UPDATE users 
+       SET hwid = NULL, hwid_resets_used = hwid_resets_used + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE discord_id = $1`,
+      [discord_id]
+    );
+    
+    // Kill all sessions
+    await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discord_id]);
+    
+    await sendAlert(
+      `**HWID Reset**\n` +
+      `**User:** ${user.discord_username} (${discord_id})\n` +
+      `**Resets left:** ${user.max_hwid_resets - user.hwid_resets_used - 1}`,
+      'warning'
+    );
+    
+    res.json({ 
+      success: true,
+      resets_left: user.max_hwid_resets - user.hwid_resets_used - 1
+    });
+  } catch (e) {
+    console.error('❌ Reset error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
@@ -852,39 +1025,38 @@ app.post('/bot/check-key', async (req, res) => {
 // BOT API - Extend Subscription
 // ═══════════════════════════════════════════════════════════════
 app.post('/bot/extend-sub', async (req, res) => {
-  const { admin_token, key, days } = req.body || {};
+  const { admin_token, discord_id, days } = req.body || {};
   
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   
-  if (!key || !days) {
+  if (!discord_id || !days) {
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
   try {
     const result = await pool.query(
-      'SELECT * FROM keys WHERE key_id = $1',
-      [key]
+      'SELECT * FROM users WHERE discord_id = $1',
+      [discord_id]
     );
     
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Key not found' });
+      return res.status(404).json({ error: 'User not found' });
     }
     
-    const keyData = result.rows[0];
-    const currentExp = keyData.subscription_expires;
+    const user = result.rows[0];
+    const currentExp = user.subscription_expires;
     const newExp = Math.max(currentExp, Date.now()) + (days * 24 * 60 * 60 * 1000);
     
     await pool.query(
-      'UPDATE keys SET subscription_expires = $1, updated_at = CURRENT_TIMESTAMP WHERE key_id = $2',
-      [newExp, key]
+      'UPDATE users SET subscription_expires = $1, updated_at = CURRENT_TIMESTAMP WHERE discord_id = $2',
+      [newExp, discord_id]
     );
     
     await sendAlert(
       `**Subscription Extended**\n` +
-      `**Key:** ${key}\n` +
-      `**User:** ${keyData.discord_username}\n` +
+      `**User:** ${user.discord_username} (${discord_id})\n` +
       `**Added:** ${days} days`,
       'info'
     );
@@ -900,42 +1072,42 @@ app.post('/bot/extend-sub', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// BOT API - Ban/Unban Key
+// BOT API - Ban/Unban User
 // ═══════════════════════════════════════════════════════════════
-app.post('/bot/ban-key', async (req, res) => {
-  const { admin_token, key, ban, reason } = req.body || {};
+app.post('/bot/ban-user', async (req, res) => {
+  const { admin_token, discord_id, ban, reason } = req.body || {};
   
   if (!admin_token || admin_token !== process.env.BOT_ADMIN_TOKEN) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   
-  if (!key || ban === undefined) {
+  if (!discord_id || ban === undefined) {
     return res.status(400).json({ error: 'Missing parameters' });
   }
   
   try {
     await pool.query(
-      `UPDATE keys 
+      `UPDATE users 
        SET banned = $1, ban_reason = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE key_id = $3`,
-      [ban, reason || null, key]
+       WHERE discord_id = $3`,
+      [ban, reason || null, discord_id]
     );
     
     // Kill all sessions if banning
     if (ban) {
-      await pool.query('DELETE FROM sessions WHERE key_id = $1', [key]);
+      await pool.query('DELETE FROM sessions WHERE discord_id = $1', [discord_id]);
     }
     
     await sendAlert(
-      `**Key ${ban ? 'Banned' : 'Unbanned'}**\n` +
-      `**Key:** ${key}\n` +
+      `**User ${ban ? 'Banned' : 'Unbanned'}**\n` +
+      `**Discord ID:** ${discord_id}\n` +
       (reason ? `**Reason:** ${reason}` : ''),
       ban ? 'warning' : 'info'
     );
     
     res.json({ success: true });
   } catch (e) {
-    console.error('❌ Ban key error:', e);
+    console.error('❌ Ban user error:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
@@ -952,11 +1124,11 @@ app.use((req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.listen(PORT, async () => {
   console.log(`\n🔐 ═══════════════════════════════════════════`);
-  console.log(`   ULTRA SECURE LOADER V2.0 (Key Auth)`);
+  console.log(`   ULTRA SECURE LOADER V3.0 (Discord Auth)`);
   console.log(`   ═══════════════════════════════════════════`);
   console.log(`   ✅ Port: ${PORT}`);
   console.log(`   ✅ Database: PostgreSQL`);
-  console.log(`   ✅ Auth: Key-based (HWID lock)`);
+  console.log(`   ✅ Auth: Discord OAuth2 (HWID lock)`);
   console.log(`   ✅ AES-256-GCM: ENABLED`);
   console.log(`   ✅ Chunked Loading: ENABLED`);
   console.log(`   ✅ Heartbeat: 3s intervals`);
