@@ -172,6 +172,24 @@ async function runMigrations() {
     CREATE INDEX IF NOT EXISTS idx_oauth_expires ON oauth_states(expires);
   `);
   console.log('✅ Database migrations applied');
+  await pool.query(`
+  -- activity_log: добавляем недостающие колонки безопасно
+  ALTER TABLE activity_log
+    ADD COLUMN IF NOT EXISTS discord_id TEXT,
+    ADD COLUMN IF NOT EXISTS hwid       TEXT,
+    ADD COLUMN IF NOT EXISTS ip         TEXT,
+    ADD COLUMN IF NOT EXISTS details    TEXT,
+    ADD COLUMN IF NOT EXISTS event_type TEXT,
+    ADD COLUMN IF NOT EXISTS timestamp  BIGINT;
+
+  -- на всякий случай индексы (idempotent)
+  CREATE INDEX IF NOT EXISTS idx_activity_discord ON activity_log(discord_id);
+  CREATE INDEX IF NOT EXISTS idx_activity_time    ON activity_log(timestamp);
+
+  -- полезные индексы для users/sessions (быстрее проверки)
+  CREATE INDEX IF NOT EXISTS idx_users_discord    ON users(discord_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_discord ON sessions(discord_id);
+`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1169,3 +1187,4 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
