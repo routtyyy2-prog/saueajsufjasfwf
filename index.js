@@ -397,11 +397,7 @@ const authLimiter = rateLimit({
   message: { error: 'Too many auth attempts' }
 });
 
-const chunkLimiter = rateLimit({
-  windowMs: 1000,
-  max: 30,
-  message: { error: 'Slow down chunk requests' }
-});
+
 
 app.use('/auth/discord', authLimiter);
 app.use('/script/chunk', chunkLimiter);
@@ -1380,6 +1376,7 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
 
