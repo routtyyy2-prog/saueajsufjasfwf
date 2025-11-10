@@ -251,7 +251,7 @@ async function createNeededTables() {
 
 async function initializeSchema() {
   console.log(`ℹ INIT_MODE=${INIT_MODE}`);
-  if (INIT_MODE === 'reset_all') {
+  if (INIT_MODE === 'reset') {
     try {
       await hardResetPublicSchema();
     } catch (e) {
@@ -1126,6 +1126,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
