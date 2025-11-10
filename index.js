@@ -57,16 +57,19 @@ function deriveKey(hwid, chunkIndex) {
   return crypto.hkdfSync('sha256', Buffer.from(hwid + chunkIndex, 'utf8'), salt, info, 32);
 }
 
+// Replace encryptChunk function with ChaCha20-Poly1305
 function encryptChunk(buffer, hwid, chunkIndex) {
   const key = deriveKey(hwid, chunkIndex);
-  const iv = crypto.randomBytes(12); // 12 bytes for GCM
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, {
+    authTagLength: 16
+  });
   
   const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
   const authTag = cipher.getAuthTag();
   
-  // Format: [iv(12)][authTag(16)][encrypted]
-  return Buffer.concat([iv, authTag, encrypted]).toString('base64');
+  // Format: [nonce(12)][authTag(16)][encrypted]
+  return Buffer.concat([nonce, authTag, encrypted]).toString('base64');
 }
 
 function signedJson(res, obj) {
