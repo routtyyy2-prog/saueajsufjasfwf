@@ -36,7 +36,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '8192', 10); // Уменьшили для более частых чанков
 const CHUNK_RPS  = parseInt(process.env.CHUNK_RPS  || '120', 10);
 const FAKE_CHUNK_RATIO = 0.3; // 30% фейковых чанков
-
+const DEBUG_PLAIN = process.env.DEBUG_PLAIN === '1';
 const chunkLimiter = rateLimit({
   windowMs: 1000,
   max: CHUNK_RPS,
@@ -98,6 +98,10 @@ function constantTimeCompare(a, b) {
 // FIXED ADVANCED XOR OBFUSCATION
 // ═══════════════════════════════════════════════════════════════
 function advancedXorObfuscate(buffer, hwid, chunkIndex) {
+  if (DEBUG_PLAIN) {
+    console.log(`[DEBUG] Plain chunk ${chunkIndex}, len=${buffer.length}, md5=${md5(buffer)}`);
+    return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
+  }
   if (process.env.DISABLE_ENC === '1') {
     return Buffer.concat([Buffer.from('PLAIN0'), buffer]).toString('base64');
   }
@@ -1362,5 +1366,6 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
