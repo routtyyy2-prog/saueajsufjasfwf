@@ -678,32 +678,20 @@ app.post('/load', async (req, res) => {
     res.status(500).json({ error: 'Internal error' });
   }
 });
-function splitTextRandom(text, parts = 50) {
-  const chunkSize = Math.ceil(text.length / parts);
-  const chunks = [];
-  for (let i = 0; i < parts; i++) {
-    const start = i * chunkSize;
-    const end = start + chunkSize;
-    chunks.push(text.slice(start, end));
-  }
-  return chunks.sort(() => Math.random() - 0.5); // случайный порядок
-}
+// Хранилище частей на время сессии загрузки
+const chunkStores = new Map(); // tokenHash -> { items, served: Set<number>, hwid, key, ip, created }
 
-// аккуратно режем БЕЗ перемешивания
+// Детерминированно режем код
 function splitTextDeterministic(text, parts = 50) {
   const out = [];
   const chunkSize = Math.ceil(text.length / parts);
   for (let i = 0; i < parts; i++) {
-    const start = i * chunkSize;
-    const end = start + chunkSize;
-    out.push(text.slice(start, end));
+    const start = i * chunkSize, end = start + chunkSize;
+    const slice = text.slice(start, end);
+    if (slice.length) out.push(slice);
   }
-  // обрезаем пустышки с хвоста
-  while (out.length && out[out.length - 1].length === 0) out.pop();
   return out;
 }
-
-// честная тасовка Фишера—Йетса
 function shuffleInPlace(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -712,75 +700,87 @@ function shuffleInPlace(arr) {
   return arr;
 }
 
-app.post('/load_split', async (req, res) => {
+// 1) Манифест: готовим части и кладём в chunkStores (без отдачи самих данных)
+app.post('/load_manifest', async (req, res) => {
   const ip = getClientIP(req);
-  const { token } = req.body || {};
+  const { token, parts = 50 } = req.body || {};
 
-  if (!token) {
-    await logSuspiciousActivity(ip, null, null, 'No token');
-    return res.status(400).json({ error: 'No token' });
-  }
+  if (!token) return res.status(400).json({ error: 'No token' });
 
   const tokenHash = sha256(token);
   const tdata = tokens.get(tokenHash);
-
-  if (!tdata) {
-    await logSuspiciousActivity(ip, null, null, 'Invalid token');
-    return res.status(403).json({ error: 'Bad token' });
-  }
-
+  if (!tdata) return res.status(403).json({ error: 'Bad token' });
   if (Date.now() > tdata.expires) {
     tokens.delete(tokenHash);
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token expired');
     return res.status(403).json({ error: 'Expired' });
   }
-
-  if (tdata.used) {
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Token reuse', true);
-    await sendAlert(`**TOKEN REUSE**\nKey: \`${tdata.key}\`\nHWID: \`${tdata.hwid}\`\nIP: \`${ip}\``, 'critical');
-    return res.status(403).json({ error: 'Token used' });
-  }
-
-  tdata.used = true;
+  if (tdata.ip !== ip) return res.status(403).json({ error: 'IP mismatch' });
 
   try {
     const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
-    if (!scriptPath) {
-      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Unknown script');
-      return res.status(404).json({ error: 'Script not found' });
-    }
+    if (!scriptPath) return res.status(404).json({ error: 'Script not found' });
 
     const scriptCode = await fetchGitLabScript(scriptPath);
-    if (!scriptCode) {
-      await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'Script fetch failed');
-      return res.status(502).json({ error: 'Upstream error' });
-    }
+    if (!scriptCode) return res.status(502).json({ error: 'Upstream error' });
 
-    // 1) режем и нумеруем по исходному порядку
-    const slices = splitTextDeterministic(scriptCode, 50);
-
-    // 2) шифруем и подписываем КАЖДУЮ часть
+    const slices = splitTextDeterministic(scriptCode, Number(parts) || 50);
+    // заранее шифруем и подписываем каждую часть
     const items = slices.map((plain, i) => {
       const enc = xorEncrypt(plain, tdata.hwid);
-      return {
-        idx: i + 1,                      // <-- индекс правильного порядка
-        data: enc,
-        sig: hmacMd5LuaCompat(SECRET_KEY, enc)
-      };
+      return { idx: i + 1, data: enc, sig: hmacMd5LuaCompat(SECRET_KEY, enc) };
     });
-
-    // 3) только теперь перемешиваем объекты
+    // порядок для клиента можно перемешать (он всё равно соберёт по idx)
     shuffleInPlace(items);
 
-    signedJson(res, { chunks: items });
-    console.log(`✅ Script delivered in ${items.length} chunks to ${ip}`);
+    chunkStores.set(tokenHash, {
+      items,
+      served: new Set(),
+      hwid: tdata.hwid,
+      key: tdata.key,
+      ip,
+      created: Date.now()
+    });
 
+    // ВНИМАНИЕ: НЕ помечаем token как used; он нужен для последующих /load_chunk
+    signedJson(res, {
+      count: items.length,
+      order_hint: items.map(x => x.idx) // необязательно, чисто информативно
+    });
   } catch (e) {
-    console.error("❌ LOAD_SPLIT ERROR:", e);
-    await logSuspiciousActivity(ip, tdata.hwid, tdata.key, 'LoadSplit error: ' + e.message);
+    console.error('LOAD_MANIFEST ERROR:', e);
     res.status(500).json({ error: 'Internal error' });
   }
 });
+
+// 2) Отдача одной части по запросу индекса
+app.post('/load_chunk', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, idx } = req.body || {};
+  if (!token || !idx) return res.status(400).json({ error: 'Missing params' });
+
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+  if (!tdata) return res.status(403).json({ error: 'Bad token' });
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  if (tdata.ip !== ip) return res.status(403).json({ error: 'IP mismatch' });
+
+  const store = chunkStores.get(tokenHash);
+  if (!store) return res.status(404).json({ error: 'No manifest' });
+
+  const part = store.items.find(x => x.idx === Number(idx));
+  if (!part) return res.status(404).json({ error: 'No such part' });
+
+  store.served.add(Number(idx));
+  // Когда отдали все — чистим
+  if (store.served.size >= store.items.length) {
+    chunkStores.delete(tokenHash);
+    // теперь можно «погасить» токен, чтобы его нельзя было переиспользовать
+    tokens.delete(tokenHash);
+  }
+
+  signedJson(res, part);
+});
+
 
 
 // === TAMPER REPORT ===
@@ -844,5 +844,6 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
