@@ -1,6 +1,6 @@
 // ╔════════════════════════════════════════════════════════════════╗
-// ║          SECURE LOADER V4.0 - AES-256-GCM ENCRYPTION          ║
-// ║  • AES-256-GCM authenticated encryption                        ║
+// ║       SECURE LOADER V4.1 - ChaCha20-Poly1305 ENCRYPTION       ║
+// ║  • ChaCha20-Poly1305 authenticated encryption                  ║
 // ║  • Per-chunk unique keys derived from HWID                     ║
 // ║  • HMAC-SHA256 response signing                                ║
 // ║  • PostgreSQL session management                               ║
@@ -30,7 +30,6 @@ const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '8192', 10);
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || "http://localhost:8080/auth/discord/callback";
-const OAUTH_STATE_SECRET = crypto.randomBytes(32).toString('hex');
 
 // Script source
 const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID || '';
@@ -51,16 +50,14 @@ function hmacSha256(key, data) {
 }
 
 function deriveKey(hwid, chunkIndex) {
-  // Derive unique 32-byte key for each chunk using HKDF
-  const salt = Buffer.from(SECRET_KEY, 'utf8');
-  const info = Buffer.from(`${hwid}:${chunkIndex}`, 'utf8');
-  return crypto.hkdfSync('sha256', Buffer.from(hwid + chunkIndex, 'utf8'), salt, info, 32);
+  const material = SECRET_KEY + String(hwid) + String(chunkIndex);
+  return crypto.createHash('sha256').update(material).digest();
 }
 
-// Replace encryptChunk function with ChaCha20-Poly1305
 function encryptChunk(buffer, hwid, chunkIndex) {
   const key = deriveKey(hwid, chunkIndex);
   const nonce = crypto.randomBytes(12);
+  
   const cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, {
     authTagLength: 16
   });
@@ -302,9 +299,9 @@ app.get('/health', async (req, res) => {
     res.json({
       status: 'online',
       database: 'connected',
-      version: '4.0',
+      version: '4.1',
       scripts_loaded: SCRIPT_CHUNKS.size,
-      encryption: 'aes-256-gcm'
+      encryption: 'chacha20-poly1305'
     });
   } catch (e) {
     res.status(500).json({ status: 'degraded', error: e.message });
@@ -327,7 +324,7 @@ app.post('/auth/discord/init', async (req, res) => {
   
   try {
     const state = crypto.randomBytes(32).toString('hex');
-    const statePayload = md5(state + hwid + OAUTH_STATE_SECRET);
+    const statePayload = md5(state + hwid + SECRET_KEY);
     
     await pool.query(
       `INSERT INTO oauth_states (state, hwid, created_at, expires) VALUES ($1, $2, $3, $4)`,
@@ -475,7 +472,7 @@ app.post('/auth/discord/poll', async (req, res) => {
   
   try {
     const sessionResult = await pool.query(
-      'SELECT session_id, expires, subscription_expires FROM sessions s JOIN users u ON s.discord_id = u.discord_id WHERE s.hwid = $1 AND s.expires > $2 ORDER BY s.created_at DESC LIMIT 1',
+      'SELECT s.session_id, s.expires, u.subscription_expires FROM sessions s JOIN users u ON s.discord_id = u.discord_id WHERE s.hwid = $1 AND s.expires > $2 ORDER BY s.created_at DESC LIMIT 1',
       [hwid, Date.now()]
     );
     
@@ -619,8 +616,8 @@ app.post('/heartbeat', async (req, res) => {
     await prepareAllScripts();
     
     app.listen(PORT, () => {
-      console.log(`\n🚀 Secure Loader V4.0 running on port ${PORT}`);
-      console.log(`📊 Encryption: AES-256-GCM`);
+      console.log(`\n🚀 Secure Loader V4.1 running on port ${PORT}`);
+      console.log(`📊 Encryption: ChaCha20-Poly1305`);
       console.log(`🔑 SECRET_KEY: ${SECRET_KEY.substring(0, 8)}...`);
     });
   } catch (e) {
