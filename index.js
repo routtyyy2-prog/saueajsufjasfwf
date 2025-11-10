@@ -25,6 +25,8 @@ const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 const DATABASE_URL = process.env.DATABASE_URL;
+const INIT_MODE = (process.env.INIT_MODE || "migrate").toLowerCase(); // "migrate" | "reset"
+
 function md5hex(s) {
   return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
@@ -1038,6 +1040,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
