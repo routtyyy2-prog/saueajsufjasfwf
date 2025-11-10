@@ -392,6 +392,41 @@ function checkScriptAllowed(keyEntry, scriptName) {
   if (!keyEntry.scripts || keyEntry.scripts.length === 0) return true;
   return keyEntry.scripts.includes(scriptName);
 }
+function sealForHWID(hwid, obj) {
+  const json = JSON.stringify(obj);
+  const blob = xorEncrypt(json, hwid);                // уже есть xorEncrypt
+  const sig  = hmacMd5LuaCompat(SECRET_KEY, blob);    // уже есть hmacMd5LuaCompat
+  return { blob, sig };
+}
+
+// Распаковать, зная токен → получаем hwid из tokens
+function unsealFromToken(token, blob, sig) {
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+  if (!tdata) return { error: 'Bad token' };
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, blob);
+  if (expSig !== sig) return { error: 'Bad sig' };
+  try {
+    const json = Buffer.from(blob, 'base64').toString('utf8'); // xorEncrypt отдаёт base64
+    // но xorEncrypt → base64 от XOR-буфера. Дешифровать надо как на клиенте (см. ниже).
+    // Мы не можем просто base64→utf8: нужно обратный XOR. Сделаем XOR-расшифровку:
+    // Реализация зеркальная xorEncrypt:
+    const tb = Buffer.from(blob, 'base64'); // это зашифрованный буфер
+    const kb = Buffer.from(tdata.hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) {
+      res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    }
+    const fullText = res.toString('utf8');
+    // с обеих сторон у нас паддинг (см. xorEncrypt) — снимаем его:
+    const padLen = 32; // 16 байт в hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { tdata, obj: JSON.parse(plain) };
+  } catch (e) {
+    return { error: 'Decrypt fail' };
+  }
+}
 
 // === RATE LIMIT ===
 const globalLimiter = rateLimit({
@@ -783,6 +818,97 @@ app.post('/load_chunk', async (req, res) => {
   signedJson(res, part);
 });
 
+app.post('/x/manifest', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, blob, sig } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'No token' });
+
+  // Распаковать вход (parts и любые метаданные внутри blob)
+  const un = unsealFromToken(token, blob, sig);
+  if (un.error) return res.status(403).json({ error: un.error });
+  const { tdata, obj } = un;
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  // мягкая IP-проверка (не режем)
+  if (tdata.ip !== ip) console.warn(`⚠ IP changed on /x/manifest: expected=${tdata.ip}, got=${ip}`);
+
+  try {
+    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
+    if (!scriptPath) return res.status(404).json({ error: 'Script not found' });
+
+    const scriptCode = await fetchGitLabScript(scriptPath);
+    if (!scriptCode) return res.status(502).json({ error: 'Upstream error' });
+
+    const wanted = Number(obj?.parts || 50) || 50;
+    const slices = splitTextDeterministic(scriptCode, wanted);
+    // заранее шифруем и подписываем
+    const items = slices.map((plain, i) => {
+      const enc = xorEncrypt(plain, tdata.hwid);
+      return { idx: i + 1, data: enc, sig: hmacMd5LuaCompat(SECRET_KEY, enc) };
+    });
+    shuffleInPlace(items);
+
+    chunkStores.set(sha256(token), {
+      items,
+      served: new Set(),
+      hwid: tdata.hwid,
+      key: tdata.key,
+      ip,
+      created: Date.now()
+    });
+
+    // продлим TTL, чтобы успеть скачать всё
+    tdata.expires = Date.now() + 120000;
+
+    // ответ только в зашифрованном виде — снаружи ничего лишнего
+    const out = sealForHWID(tdata.hwid, { count: items.length });
+    return signedJson(res, out);
+  } catch (e) {
+    console.error('X_MANIFEST ERROR:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.post('/x/chunk_next', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, blob, sig } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'No token' });
+
+  const un = unsealFromToken(token, blob, sig);
+  if (un.error) return res.status(403).json({ error: un.error });
+  const { tdata } = un;
+
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  if (tdata.ip !== ip) console.warn(`⚠ IP changed on /x/chunk_next: expected=${tdata.ip}, got=${ip}`);
+
+  const store = chunkStores.get(sha256(token));
+  if (!store) return res.status(404).json({ error: 'No manifest' });
+
+  try {
+    // найдём любой неотданный кусок
+    const candidates = store.items.filter(x => !store.served.has(x.idx));
+    if (candidates.length === 0) {
+      // всё отдали — чистим и гасим токен
+      chunkStores.delete(sha256(token));
+      tokens.delete(sha256(token));
+      const outDone = sealForHWID(tdata.hwid, { done: true });
+      return signedJson(res, outDone);
+    }
+
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    store.served.add(pick.idx);
+
+    // Запечатаем ответ: спрячем и idx, и data, и sig
+    const out = sealForHWID(tdata.hwid, {
+      pos: pick.idx,       // позиция (idx) скрыта внутри blob
+      data: pick.data,     // шифртекст части (ещё один уровень XOR от нас)
+      sig:  pick.sig       // подпись части (HMAC от data)
+    });
+    return signedJson(res, out);
+
+  } catch (e) {
+    console.error('X_CHUNK_NEXT ERROR:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
 
 
 // === TAMPER REPORT ===
@@ -846,6 +972,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
