@@ -143,13 +143,7 @@ function rc4EncryptChunk(buffer, hwid, chunkIndex) {
   // ПРАВИЛЬНЫЙ HMAC совместимый с Lua клиентом
   // ============================================================
   
-  // Lua код делает:
-  // local data_for_hmac = encrypted .. meta_str
-  // local hmac_hex = hmac_md5(SECRET_KEY, data_for_hmac)
-  
-  // Где hmac_md5 работает со строками (binary strings)
-  
-  // Конвертируем encrypted Buffer в binary string (сохраняет байты 1:1)
+  // Конвертируем encrypted Buffer в binary string
   let encryptedBinary = '';
   for (let i = 0; i < encrypted.length; i++) {
     encryptedBinary += String.fromCharCode(encrypted[i]);
@@ -158,7 +152,7 @@ function rc4EncryptChunk(buffer, hwid, chunkIndex) {
   const metaStr = `${hwid}:${chunkIndex}`;
   const messageForHmac = encryptedBinary + metaStr;
   
-  // Используем существующую строковую функцию hmacMd5
+  // Используем строковую функцию hmacMd5 (НЕ hmacMd5Buf!)
   const hmacHex = hmacMd5(SECRET_KEY, messageForHmac);
   
   // Конвертируем hex обратно в Buffer
@@ -1062,5 +1056,6 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
