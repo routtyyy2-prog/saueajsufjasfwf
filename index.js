@@ -551,6 +551,24 @@ function sealForHWID(hwid, obj) {
   const sig  = hmacMd5LuaCompat(SECRET_KEY, blob);    // уже есть hmacMd5LuaCompat
   return { blob, sig };
 }
+function unsealForHWID(hwid, blob, sig) {
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, blob); // ВАЖНО: только blob
+  if (expSig !== sig) return { error: 'Bad sig' };
+
+  try {
+    const tb = Buffer.from(blob, 'base64');
+    const kb = Buffer.from(hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    const fullText = res.toString('utf8');
+    const padLen = 32; // 16 байт в hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { obj: JSON.parse(plain) };
+  } catch {
+    return { error: 'Decrypt fail' };
+  }
+}
 
 // Распаковать, зная токен → получаем hwid из tokens
 function unsealFromToken(token, blob, sig) {
@@ -839,7 +857,7 @@ app.post('/auth_x', async (req, res) => {
   try {
     if (!hwid || !blob || !sig) return res.status(400).json({ error: 'Missing params' });
 
-    const un = unsealAuth(hwid, blob, sig);
+    const un = unsealForHWID(hwid, blob, sig);
     if (un.error) return res.status(403).json({ error: un.error });
 
     const { key, script_name, timestamp, nonce, fp } = un.obj || {};
@@ -895,10 +913,10 @@ app.post('/auth_x', async (req, res) => {
     tokens.set(tokenHash, tokenData);
 
     // но ответ - тоже «запечатанный»
-    const out = sealAuth(hwid, {
-      token: xorEncrypt(token, hwid),  // можешь и прямо token, но так совместимо
-      expires_in: 5,
-      server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
+    const out = sealForHWID(hwid, {
+        token: xorEncrypt(token, hwid),
+        expires_in: 5,
+        server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
     });
     return signedJson(res, out);
 
@@ -1289,6 +1307,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
