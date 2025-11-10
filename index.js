@@ -400,9 +400,11 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => req.ip,
-  message: { error: 'Rate limit' }
+  message: { error: 'Rate limit' },
+  skip: (req) => req.path === '/load_manifest' || req.path === '/load_chunk'
 });
 app.use(globalLimiter);
+
 
 // === HEALTH ===
 app.get('/health', async (req, res) => {
@@ -844,6 +846,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
