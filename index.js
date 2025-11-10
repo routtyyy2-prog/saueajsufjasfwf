@@ -436,9 +436,15 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => req.ip,
   message: { error: 'Rate limit' },
-  skip: (req) => req.path === '/load_manifest' || req.path === '/load_chunk'
+  skip: (req) => (
+    req.path === '/load_manifest' ||
+    req.path === '/load_chunk'   ||
+    req.path === '/x/manifest'   ||
+    req.path === '/x/chunk_next'
+  )
 });
 app.use(globalLimiter);
+
 
 
 // === HEALTH ===
@@ -972,6 +978,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
 
 
 
