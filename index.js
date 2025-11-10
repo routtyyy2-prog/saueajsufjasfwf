@@ -26,7 +26,7 @@ app.use(express.static('public')); // для OAuth callback страницы
 const PORT = process.env.PORT || 8080;
 const SECRET_KEY = process.env.SECRET_KEY || "k8Jf2mP9xLq4nR7vW3sT6yH5bN8aZ1cD";
 const SECRET_CHECKSUM = crypto.createHash('md5').update(SECRET_KEY).digest('hex');
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
+const DISCORD_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 
 // Discord OAuth2
@@ -313,18 +313,65 @@ async function loadAndChunkFromGit(scriptId, rawUrl) {
  * Подготовка всех скриптов.
  * Здесь ты указываешь URL каждого скрипта.
  */
-async function prepareAllScripts() {
-  console.log('\n📦 Preparing scripts (remote)...');
-
-  // === твой скрипт ===
-  await loadAndChunkFromGit(
-    'kaelis.gs',
-    'https://gitlab.com/fwafsjafkawf0/fwafsjafkawf0koop/-/raw/main/test12.lua'
-  );
-
-  // можешь добавить другие:
-  // await loadAndChunkFromGit('another.gs', 'https://gitlab.com/.../another.lua');
+async function fetchWithRetries(url, opts = {}, attempts = 4) {
+  let err;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'secure-loader/3.0', ...(opts.headers||{}) },
+        ...opts,
+      });
+      if (res.ok) return res;
+      if (![403,429,500,502,503,504].includes(res.status)) {
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+      err = new Error(`${res.status} ${res.statusText}`);
+    } catch (e) { err = e; }
+    await new Promise(r => setTimeout(r, 250 * 2**i));
+  }
+  throw err;
 }
+
+async function getScriptCodeFromEnv() {
+  const RAW_URL   = process.env.REPO_RAW_URL || '';            // твоя переменная
+  const PROJ_ID   = process.env.GITLAB_PROJECT_ID || '';
+  const FILE_PATH = process.env.GITLAB_FILE_PATH || 'test12.lua';
+  const REF       = process.env.GITLAB_BRANCH || 'main';
+  const TOKEN     = process.env.GITLAB_TOKEN || '';
+
+  // 1) Приватный репо через GitLab API
+  if (PROJ_ID && FILE_PATH && TOKEN) {
+    const encPath = encodeURIComponent(FILE_PATH);
+    const api = `https://gitlab.com/api/v4/projects/${PROJ_ID}/repository/files/${encPath}/raw?ref=${encodeURIComponent(REF)}`;
+    const res = await fetchWithRetries(api, { headers: { 'PRIVATE-TOKEN': TOKEN } });
+    return await res.text();
+  }
+
+  // 2) Прямой RAW (если публичный или с заголовком PRIVATE-TOKEN)
+  if (RAW_URL) {
+    const headers = TOKEN ? { 'PRIVATE-TOKEN': TOKEN } : {};
+    const res = await fetchWithRetries(RAW_URL, { headers });
+    return await res.text();
+  }
+
+  throw new Error('No source configured: set GITLAB_* or REPO_RAW_URL');
+}
+
+function chunkAndStore(scriptId, code) {
+  const CHUNK_SIZE = 500;
+  const chunks = [];
+  for (let i = 0; i < code.length; i += CHUNK_SIZE) chunks.push(code.slice(i, i + CHUNK_SIZE));
+  const hash = crypto.createHash('sha256').update(code).digest('hex');
+  SCRIPT_CHUNKS.set(scriptId, { chunks, total: chunks.length, hash, size: code.length });
+  console.log(`✅ ${scriptId}: ${chunks.length} chunks (${code.length} bytes, sha256=${hash.slice(0,8)}…)`);
+}
+
+async function prepareAllScripts() {
+  console.log('\n📦 Preparing scripts (from env)…');
+  const code = await getScriptCodeFromEnv(); // бросит ошибку если не смог
+  chunkAndStore('kaelis.gs', code);
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // RATE LIMITING
@@ -1280,5 +1327,6 @@ app.listen(PORT, async () => {
   await prepareAllScripts();
   console.log('✅ All scripts ready!\n');
 });
+
 
 
