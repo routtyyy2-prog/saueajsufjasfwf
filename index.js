@@ -25,6 +25,16 @@ const GITLAB_BRANCH = process.env.GITLAB_BRANCH || "main";
 const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || "";
 const EXPECTED_CERT_FINGERPRINT = process.env.CERT_FINGERPRINT || "";
 const DATABASE_URL = process.env.DATABASE_URL;
+const INIT_MODE = (process.env.INIT_MODE || "migrate").toLowerCase(); // "migrate" | "reset"
+const BOT_ADMIN_TOKEN = process.env.BOT_ADMIN_TOKEN || "";
+function requireBotAdmin(req, res) {
+  const tok = String(req.body?.admin_token || '');
+  if (!BOT_ADMIN_TOKEN || tok !== BOT_ADMIN_TOKEN) {
+    res.status(403).json({ error: 'Forbidden' });
+    return false;
+  }
+  return true;
+}
 function md5hex(s) {
   return crypto.createHash('md5').update(s, 'utf8').digest('hex');
 }
@@ -88,42 +98,185 @@ const pool = new Pool({
 pool.on('error', (err) => {
   console.error('âŒ PostgreSQL pool error:', err);
 });
-async function runMigrations() {
-  await pool.query(`
-  CREATE TABLE IF NOT EXISTS keys (
-    key_name TEXT PRIMARY KEY,
-    hwid TEXT DEFAULT NULL,
-    expires BIGINT NOT NULL,
-    scripts JSONB DEFAULT '[]',
-    banned BOOLEAN DEFAULT FALSE,
-    ban_reason TEXT,
-    banned_at BIGINT,
-    banned_hwid TEXT,
-    banned_ip TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS banned_hwids (
-    hwid TEXT PRIMARY KEY,
-    reason TEXT,
-    banned_at BIGINT,
-    banned_by_key TEXT,
-    banned_ip TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS activity_log (
-    id BIGSERIAL PRIMARY KEY,
-    event_type TEXT,
-    ip TEXT,
-    hwid TEXT,
-    key_name TEXT,
-    details TEXT,
-    timestamp BIGINT
-  );
-  `);
-  console.log('âœ… DB migrations applied');
+async function hardResetPublicSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Самый простой и чистый способ снести всё
+    await client.query('DROP SCHEMA IF EXISTS public CASCADE;');
+    await client.query('CREATE SCHEMA public;');
+    // (опционально) вернуть дефолтные права
+    await client.query('GRANT ALL ON SCHEMA public TO public;');
+    await client.query('COMMIT');
+    console.log('✅ Dropped & recreated schema "public"');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ hardResetPublicSchema failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
 }
+
+// Фолбэк, если DROP SCHEMA запрещён (хостинг урезал права)
+async function dropAllObjectsFallback() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Сгенерим DROP для всех объектов в public (таблицы/вьюхи/последовательности/типы)
+    const q = `
+      DO $$
+      DECLARE r RECORD;
+      BEGIN
+        -- drop views first
+        FOR r IN (SELECT 'DROP VIEW IF EXISTS public.' || quote_ident(table_name) || ' CASCADE;' AS q
+                  FROM information_schema.views WHERE table_schema='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop tables
+        FOR r IN (SELECT 'DROP TABLE IF EXISTS public.' || quote_ident(tablename) || ' CASCADE;' AS q
+                  FROM pg_tables WHERE schemaname='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop sequences
+        FOR r IN (SELECT 'DROP SEQUENCE IF EXISTS public.' || quote_ident(sequence_name) || ' CASCADE;' AS q
+                  FROM information_schema.sequences WHERE sequence_schema='public')
+        LOOP EXECUTE r.q; END LOOP;
+
+        -- drop types
+        FOR r IN (
+          SELECT 'DROP TYPE IF EXISTS public.' || quote_ident(t.typname) || ' CASCADE;' AS q
+          FROM pg_type t
+          JOIN pg_namespace n ON n.oid = t.typnamespace
+          WHERE n.nspname='public' AND t.typcategory NOT IN ('A','P') AND t.typtype IN ('e','c','d') -- enum/composite/domain
+        )
+        LOOP EXECUTE r.q; END LOOP;
+      END$$;`;
+    await client.query(q);
+    await client.query('COMMIT');
+    console.log('✅ Dropped all objects in schema "public" (fallback)');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ dropAllObjectsFallback failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function createNeededTables() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // === только то, что нужно серверу ===
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS keys (
+        key_name    TEXT PRIMARY KEY,
+        hwid        TEXT DEFAULT NULL,
+        expires     BIGINT NOT NULL,
+        scripts     JSONB DEFAULT '[]',
+        banned      BOOLEAN DEFAULT FALSE,
+        ban_reason  TEXT,
+        banned_at   BIGINT,
+        banned_hwid TEXT,
+        banned_ip   TEXT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS banned_hwids (
+        hwid          TEXT PRIMARY KEY,
+        reason        TEXT,
+        banned_at     BIGINT,
+        banned_by_key TEXT,
+        banned_ip     TEXT
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id         BIGSERIAL PRIMARY KEY,
+        event_type TEXT,
+        ip         TEXT,
+        hwid       TEXT,
+        key_name   TEXT,
+        details    TEXT,
+        timestamp  BIGINT
+      );
+    `);
+
+    // Для Discord-бота (ключи/пользователи). Удали, если бот сейчас не нужен:
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        discord_id           TEXT PRIMARY KEY,
+        discord_username     TEXT,
+        subscription_expires BIGINT DEFAULT 0,
+        hwid                 TEXT,
+        banned               BOOLEAN DEFAULT FALSE,
+        ban_reason           TEXT,
+        resets_left          INT DEFAULT 3,
+        scripts              JSONB DEFAULT '[]',
+        last_login           BIGINT,
+        created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS invite_keys (
+        key         TEXT PRIMARY KEY,
+        days        INT NOT NULL,
+        uses_left   INT NOT NULL,
+        expires_at  BIGINT,
+        scripts     JSONB DEFAULT '[]',
+        note        TEXT,
+        revoked     BOOLEAN DEFAULT FALSE,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Индексы
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_expires  ON keys(expires);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_keys_banned   ON keys(banned);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_log_ts        ON activity_log(timestamp);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_exp     ON users(subscription_expires);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_banned  ON users(banned);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_inv_keys_exp  ON invite_keys(expires_at);`);
+
+    await client.query('COMMIT');
+    console.log('✅ Created ONLY required tables');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ createNeededTables failed:', e.message);
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function initializeSchema() {
+  console.log(`ℹ INIT_MODE=${INIT_MODE}`);
+
+  if (INIT_MODE === 'reset') {
+    // Жёсткий сброс схемы с фолбэком
+    try {
+      await hardResetPublicSchema();
+    } catch {
+      console.warn('⚠ hardResetPublicSchema unavailable, trying fallback…');
+      await dropAllObjectsFallback();
+    }
+    await createNeededTables();
+    return;
+  }
+
+  // migrate (по умолчанию) — просто ensure
+  await createNeededTables();
+}
+
+
 
 const tokens = new Map();
 const nonces = new Map();
@@ -392,6 +545,83 @@ function checkScriptAllowed(keyEntry, scriptName) {
   if (!keyEntry.scripts || keyEntry.scripts.length === 0) return true;
   return keyEntry.scripts.includes(scriptName);
 }
+function sealForHWID(hwid, obj) {
+  const json = JSON.stringify(obj);
+  const blob = xorEncrypt(json, hwid);                // уже есть xorEncrypt
+  const sig  = hmacMd5LuaCompat(SECRET_KEY, blob);    // уже есть hmacMd5LuaCompat
+  return { blob, sig };
+}
+function unsealForHWID(hwid, blob, sig) {
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, blob); // ВАЖНО: только blob
+  if (expSig !== sig) return { error: 'Bad sig' };
+
+  try {
+    const tb = Buffer.from(blob, 'base64');
+    const kb = Buffer.from(hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    const fullText = res.toString('utf8');
+    const padLen = 32; // 16 байт в hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { obj: JSON.parse(plain) };
+  } catch {
+    return { error: 'Decrypt fail' };
+  }
+}
+
+// Распаковать, зная токен → получаем hwid из tokens
+function unsealFromToken(token, blob, sig) {
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+  if (!tdata) return { error: 'Bad token' };
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, blob);
+  if (expSig !== sig) return { error: 'Bad sig' };
+  try {
+    const json = Buffer.from(blob, 'base64').toString('utf8'); // xorEncrypt отдаёт base64
+    // но xorEncrypt → base64 от XOR-буфера. Дешифровать надо как на клиенте (см. ниже).
+    // Мы не можем просто base64→utf8: нужно обратный XOR. Сделаем XOR-расшифровку:
+    // Реализация зеркальная xorEncrypt:
+    const tb = Buffer.from(blob, 'base64'); // это зашифрованный буфер
+    const kb = Buffer.from(tdata.hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) {
+      res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    }
+    const fullText = res.toString('utf8');
+    // с обеих сторон у нас паддинг (см. xorEncrypt) — снимаем его:
+    const padLen = 32; // 16 байт в hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { tdata, obj: JSON.parse(plain) };
+  } catch (e) {
+    return { error: 'Decrypt fail' };
+  }
+}
+function sealAuth(hwid, obj) {
+  const json = JSON.stringify(obj);
+  const blob = xorEncrypt(json, hwid);                  // шифруем от HWID
+  const sig  = hmacMd5LuaCompat(SECRET_KEY, hwid + blob); // подпись от сервера
+  return { blob, sig };
+}
+
+function unsealAuth(hwid, blob, sig) {
+  if (!blob || !sig) return { error: 'Missing blob/sig' };
+  const expSig = hmacMd5LuaCompat(SECRET_KEY, hwid + blob);
+  if (expSig !== sig) return { error: 'Bad sig' };
+
+  // расшифровка «зеркалом» xorEncrypt
+  try {
+    const tb = Buffer.from(blob, 'base64');
+    const kb = Buffer.from(hwid, 'utf8');
+    const res = Buffer.alloc(tb.length);
+    for (let i = 0; i < tb.length; i++) res[i] = tb[i] ^ kb[i % kb.length] ^ (i & 0xFF);
+    const fullText = res.toString('utf8');
+    const padLen = 32; // 16 байт hex = 32 символа
+    const plain = fullText.slice(padLen, fullText.length - padLen);
+    return { obj: JSON.parse(plain) };
+  } catch { return { error: 'Decrypt fail' }; }
+}
 
 // === RATE LIMIT ===
 const globalLimiter = rateLimit({
@@ -400,9 +630,17 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => req.ip,
-  message: { error: 'Rate limit' }
+  message: { error: 'Rate limit' },
+  skip: (req) => (
+    req.path === '/load_manifest' ||
+    req.path === '/load_chunk'   ||
+    req.path === '/x/manifest'   ||
+    req.path === '/x/chunk_next'
+  )
 });
 app.use(globalLimiter);
+
+
 
 // === HEALTH ===
 app.get('/health', async (req, res) => {
@@ -578,7 +816,7 @@ app.post('/auth', async (req, res) => {
       ua, 
       key: keyEntry.key_name,
       script_name,
-      expires: now + 5000,  // Ñ‚Ð¾ÐºÐµÐ½ Ð¶Ð¸Ð²ÐµÑ‚ 5 ÑÐµÐºÑƒÐ½Ð´
+      expires: now + 15000,  // Ñ‚Ð¾ÐºÐµÐ½ Ð¶Ð¸Ð²ÐµÑ‚ 5 ÑÐµÐºÑƒÐ½Ð´
       used: false, 
       created: now 
     };
@@ -601,6 +839,90 @@ app.post('/auth', async (req, res) => {
     console.error("âŒ AUTH ERROR:", e);
     await logSuspiciousActivity(ip, hwid, key, 'Server error');
     res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.post('/auth_x', async (req, res) => {
+  const ip = getClientIP(req);
+  const ua = req.headers['user-agent'] || 'unknown';
+  const { hwid, blob, sig, client_cert_fp } = req.body || {};
+
+  // анти-MITM/пининги как в /auth
+  const mitmIndicators = detectMITM(req);
+  if (mitmIndicators.length > 0) return res.status(403).json({ error: 'Proxy detected' });
+  if (client_cert_fp && EXPECTED_CERT_FINGERPRINT && !constantTimeCompare(client_cert_fp, EXPECTED_CERT_FINGERPRINT)) {
+    await logSuspiciousActivity(ip, hwid, null, 'Certificate mismatch', true);
+    return res.status(403).json({ error: 'Invalid certificate' });
+  }
+
+  try {
+    if (!hwid || !blob || !sig) return res.status(400).json({ error: 'Missing params' });
+
+    const un = unsealForHWID(hwid, blob, sig);
+    if (un.error) return res.status(403).json({ error: un.error });
+
+    const { key, script_name, timestamp, nonce, fp } = un.obj || {};
+    if (!key || !script_name || !timestamp || !nonce) return res.status(400).json({ error: 'Missing fields' });
+
+    // опционально сверить client fp из payload
+    const expectedFp = md5(`${hwid}:${nonce}:${SECRET_CHECKSUM}`);
+    if (!constantTimeCompare(expectedFp, fp || expectedFp)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Bad FP (blob)', true);
+      return res.status(403).json({ error: 'Bad FP' });
+    }
+
+    // остальная логика — 1:1 как в /auth (бан, рейтлимит, таймстамп/реплей)
+    if (await isHwidBanned(hwid)) return res.status(403).json({ error: 'Banned' });
+    if (!checkHwidRateLimit(hwid)) return res.status(429).json({ error: 'Too many requests' });
+
+    const reqTime = parseInt(timestamp);
+    const now = Date.now();
+    if (isNaN(reqTime) || Math.abs(now - reqTime) > 30000) return res.status(403).json({ error: 'Timestamp' });
+
+    const nonceKey = `${hwid}:${timestamp}:${nonce}`;
+    if (nonces.has(nonceKey)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Replay attack', true);
+      return res.status(403).json({ error: 'Replay' });
+    }
+    nonces.set(nonceKey, now);
+
+    // подпись как раньше
+    const expectedSig = md5(SECRET_KEY + hwid + timestamp + nonce);
+    if (!constantTimeCompare(un.obj.signature || '', expectedSig)) {
+      await logSuspiciousActivity(ip, hwid, key, 'Bad sig');
+      return res.status(403).json({ error: 'Bad sig' });
+    }
+
+    // проверка ключа/скрипта/срока/привязка HWID (тож самое что в /auth)
+    const keyEntry = await getKeyByName(key);
+    if (!keyEntry) return res.status(403).json({ error: 'Invalid key' });
+    if (keyEntry.banned) return res.status(403).json({ error: 'Banned key' });
+
+    const keyExpiry = parseInt(keyEntry.expires) || 0;
+    if (keyExpiry === 0 || Math.floor(now / 1000) >= keyExpiry) return res.status(403).json({ error: 'Expired' });
+
+    const keyHwid = String(keyEntry.hwid || "*");
+    if (keyHwid === "*" || keyHwid === "" || keyHwid === null) await updateKeyHwid(keyEntry.key_name, hwid);
+    else if (keyHwid !== hwid) return res.status(403).json({ error: 'HWID mismatch' });
+
+    if (!checkScriptAllowed(keyEntry, script_name)) return res.status(403).json({ error: 'Script not allowed' });
+
+    // выдаём токен (как в /auth)
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = sha256(token);
+    const tokenData = { hwid, ip, ua, key: keyEntry.key_name, script_name, expires: now + 15000, used: false, created: now };
+    tokens.set(tokenHash, tokenData);
+
+    // но ответ - тоже «запечатанный»
+    const out = sealForHWID(hwid, {
+        token: xorEncrypt(token, hwid),
+        expires_in: 5,
+        server_fp: (EXPECTED_CERT_FINGERPRINT || '').trim()
+    });
+    return signedJson(res, out);
+
+  } catch (e) {
+    await logSuspiciousActivity(ip, hwid, null, 'Server error');
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -678,6 +1000,200 @@ app.post('/load', async (req, res) => {
     res.status(500).json({ error: 'Internal error' });
   }
 });
+// Хранилище частей на время сессии загрузки
+const chunkStores = new Map(); // tokenHash -> { items, served: Set<number>, hwid, key, ip, created }
+
+// Детерминированно режем код
+function splitTextDeterministic(text, parts = 50) {
+  const out = [];
+  const chunkSize = Math.ceil(text.length / parts);
+  for (let i = 0; i < parts; i++) {
+    const start = i * chunkSize, end = start + chunkSize;
+    const slice = text.slice(start, end);
+    if (slice.length) out.push(slice);
+  }
+  return out;
+}
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// 1) Манифест: готовим части и кладём в chunkStores (без отдачи самих данных)
+app.post('/load_manifest', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, parts = 50 } = req.body || {};
+
+  if (!token) return res.status(400).json({ error: 'No token' });
+
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+  if (!tdata) return res.status(403).json({ error: 'Bad token' });
+  if (Date.now() > tdata.expires) {
+    tokens.delete(tokenHash);
+    return res.status(403).json({ error: 'Expired' });
+  }
+  if (tdata.ip !== ip) return res.status(403).json({ error: 'IP mismatch' });
+
+  try {
+    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
+    if (!scriptPath) return res.status(404).json({ error: 'Script not found' });
+
+    const scriptCode = await fetchGitLabScript(scriptPath);
+    if (!scriptCode) return res.status(502).json({ error: 'Upstream error' });
+
+    const slices = splitTextDeterministic(scriptCode, Number(parts) || 50);
+    // заранее шифруем и подписываем каждую часть
+    const items = slices.map((plain, i) => {
+      const enc = xorEncrypt(plain, tdata.hwid);
+      return { idx: i + 1, data: enc, sig: hmacMd5LuaCompat(SECRET_KEY, enc) };
+    });
+    // порядок для клиента можно перемешать (он всё равно соберёт по idx)
+    shuffleInPlace(items);
+
+    chunkStores.set(tokenHash, {
+      items,
+      served: new Set(),
+      hwid: tdata.hwid,
+      key: tdata.key,
+      ip,
+      created: Date.now()
+    });
+
+    // ВНИМАНИЕ: НЕ помечаем token как used; он нужен для последующих /load_chunk
+    signedJson(res, {
+      count: items.length,
+      order_hint: items.map(x => x.idx) // необязательно, чисто информативно
+    });
+  } catch (e) {
+    console.error('LOAD_MANIFEST ERROR:', e);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// 2) Отдача одной части по запросу индекса
+app.post('/load_chunk', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, idx } = req.body || {};
+  if (!token || !idx) return res.status(400).json({ error: 'Missing params' });
+
+  const tokenHash = sha256(token);
+  const tdata = tokens.get(tokenHash);
+  if (!tdata) return res.status(403).json({ error: 'Bad token' });
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  if (tdata.ip !== ip) return res.status(403).json({ error: 'IP mismatch' });
+
+  const store = chunkStores.get(tokenHash);
+  if (!store) return res.status(404).json({ error: 'No manifest' });
+
+  const part = store.items.find(x => x.idx === Number(idx));
+  if (!part) return res.status(404).json({ error: 'No such part' });
+
+  store.served.add(Number(idx));
+  // Когда отдали все — чистим
+  if (store.served.size >= store.items.length) {
+    chunkStores.delete(tokenHash);
+    // теперь можно «погасить» токен, чтобы его нельзя было переиспользовать
+    tokens.delete(tokenHash);
+  }
+
+  signedJson(res, part);
+});
+
+app.post('/x/manifest', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, blob, sig } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'No token' });
+
+  // Распаковать вход (parts и любые метаданные внутри blob)
+  const un = unsealFromToken(token, blob, sig);
+  if (un.error) return res.status(403).json({ error: un.error });
+  const { tdata, obj } = un;
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  // мягкая IP-проверка (не режем)
+  if (tdata.ip !== ip) console.warn(`⚠ IP changed on /x/manifest: expected=${tdata.ip}, got=${ip}`);
+
+  try {
+    const scriptPath = SCRIPT_REGISTRY[tdata.script_name];
+    if (!scriptPath) return res.status(404).json({ error: 'Script not found' });
+
+    const scriptCode = await fetchGitLabScript(scriptPath);
+    if (!scriptCode) return res.status(502).json({ error: 'Upstream error' });
+
+    const wanted = Number(obj?.parts || 50) || 50;
+    const slices = splitTextDeterministic(scriptCode, wanted);
+    // заранее шифруем и подписываем
+    const items = slices.map((plain, i) => {
+      const enc = xorEncrypt(plain, tdata.hwid);
+      return { idx: i + 1, data: enc, sig: hmacMd5LuaCompat(SECRET_KEY, enc) };
+    });
+    shuffleInPlace(items);
+
+    chunkStores.set(sha256(token), {
+      items,
+      served: new Set(),
+      hwid: tdata.hwid,
+      key: tdata.key,
+      ip,
+      created: Date.now()
+    });
+
+    // продлим TTL, чтобы успеть скачать всё
+    tdata.expires = Date.now() + 120000;
+
+    // ответ только в зашифрованном виде — снаружи ничего лишнего
+    const out = sealForHWID(tdata.hwid, { count: items.length });
+    return signedJson(res, out);
+  } catch (e) {
+    console.error('X_MANIFEST ERROR:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+app.post('/x/chunk_next', async (req, res) => {
+  const ip = getClientIP(req);
+  const { token, blob, sig } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'No token' });
+
+  const un = unsealFromToken(token, blob, sig);
+  if (un.error) return res.status(403).json({ error: un.error });
+  const { tdata } = un;
+
+  if (Date.now() > tdata.expires) return res.status(403).json({ error: 'Expired' });
+  if (tdata.ip !== ip) console.warn(`⚠ IP changed on /x/chunk_next: expected=${tdata.ip}, got=${ip}`);
+
+  const store = chunkStores.get(sha256(token));
+  if (!store) return res.status(404).json({ error: 'No manifest' });
+
+  try {
+    // найдём любой неотданный кусок
+    const candidates = store.items.filter(x => !store.served.has(x.idx));
+    if (candidates.length === 0) {
+      // всё отдали — чистим и гасим токен
+      chunkStores.delete(sha256(token));
+      tokens.delete(sha256(token));
+      const outDone = sealForHWID(tdata.hwid, { done: true });
+      return signedJson(res, outDone);
+    }
+
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    store.served.add(pick.idx);
+
+    // Запечатаем ответ: спрячем и idx, и data, и sig
+    const out = sealForHWID(tdata.hwid, {
+      pos: pick.idx,       // позиция (idx) скрыта внутри blob
+      data: pick.data,     // шифртекст части (ещё один уровень XOR от нас)
+      sig:  pick.sig       // подпись части (HMAC от data)
+    });
+    return signedJson(res, out);
+
+  } catch (e) {
+    console.error('X_CHUNK_NEXT ERROR:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
 
 
 // === TAMPER REPORT ===
@@ -710,7 +1226,57 @@ app.post('/report_tamper', async (req, res) => {
 
   res.json({ status: 'banned', message: 'Your key has been permanently banned' });
 });
+app.post('/bot/create-key', async (req, res) => {
+  try {
+    if (!requireBotAdmin(req, res)) return;
 
+    const days   = parseInt(req.body?.days, 10);
+    const scripts= Array.isArray(req.body?.scripts) ? req.body.scripts : [];
+    const note   = req.body?.note || null;
+
+    if (!days || days < 1 || days > 365) return res.status(400).json({ error: 'Bad days' });
+
+    const keyName = require('crypto').randomBytes(8).toString('hex').toUpperCase();
+    const expires = Math.floor(Date.now() / 1000) + days * 86400; // сек
+
+    await pool.query(`
+      INSERT INTO keys (key_name, hwid, expires, scripts, banned, ban_reason, created_at, updated_at)
+      VALUES ($1, NULL, $2, $3, FALSE, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `, [keyName, expires, JSON.stringify(scripts)]);
+
+    return res.json({
+      key: keyName,
+      days,
+      expires_at: expires * 1000,
+      scripts,
+      note
+    });
+  } catch (e) {
+    console.error('create-key error:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// /bot/revoke-key — пометить ключ забаненным (лоадер перестанет пускать)
+app.post('/bot/revoke-key', async (req, res) => {
+  try {
+    if (!requireBotAdmin(req, res)) return;
+    const key = String(req.body?.key || '');
+    if (!key) return res.status(400).json({ error: 'Missing key' });
+
+    const r = await pool.query(
+      `UPDATE keys SET banned = TRUE, ban_reason = COALESCE($2,'revoked'), updated_at = CURRENT_TIMESTAMP
+       WHERE LOWER(key_name)=LOWER($1)`,
+      [key, req.body?.reason || null]
+    );
+
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Key not found' });
+    return res.json({ ok: true, updated: r.rowCount });
+  } catch (e) {
+    console.error('revoke-key error:', e);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
 // === BLOCK INVALID ===
 app.get('/auth', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /auth'); res.status(405).json({error:'POST only'}); });
 app.get('/load', (req,res)=>{ logSuspiciousActivity(getClientIP(req),null,null,'GET /load'); res.status(405).json({error:'POST only'}); });
@@ -718,7 +1284,7 @@ app.use((req,res)=>res.status(404).json({error:'Not found'}));
 
 // === START ===
 app.listen(PORT, async () => {
-  await runMigrations();
+  await initializeSchema();
   console.log(`\nðŸ”’ ============================================`);
   console.log(`   ULTRA SECURE LOADER v5.0 (PostgreSQL)`);
   console.log(`   ============================================`);
@@ -741,3 +1307,16 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
