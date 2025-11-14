@@ -72,8 +72,8 @@ function signedText(res, text) {
   res.type('text/plain').send(text);
 }
 const SCRIPT_REGISTRY = {
-  "kaelis.gs": "test12.lua",
-  // Ð´Ð¾Ð±Ð°Ð²Ð»ÑÐ¹Ñ‚Ðµ Ð´Ñ€ÑƒÐ³Ð¸Ðµ ÑÐºÑ€Ð¸Ð¿Ñ‚Ñ‹
+  "kaelis.gs":         "kaelis_stable.lua", 
+  "kaelis.gs-nightly": "kaelis_nightly.lua",
 };
 
 if (!SECRET_KEY) {
@@ -1306,4 +1306,5 @@ app.listen(PORT, async () => {
     console.error('âŒ Database connection failed:', e.message);
     process.exit(1);
   }
+
 });
